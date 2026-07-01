@@ -9,7 +9,10 @@ from datetime import date, timedelta
 from typing import Optional
 from uuid import uuid4
 
-from app.core.config import get_aez_config, Season, AEZConfig, SeasonWindow, get_settings
+from app.core.config import (
+    get_aez_config, Season, AEZConfig, SeasonWindow, get_settings,
+    get_crop_config, CropConfig,
+)
 from app.core.models import (
     FarmPolygon, SeasonResult,
     NDVIObservation, SARObservation, RainfallRecord,
@@ -99,6 +102,16 @@ class PolygonProcessor:
     """
     Fetches all data sources and runs the detection ensemble for
     one polygon × one season. Returns a SeasonResult.
+
+    Modes
+    -----
+    GEE mode (default, --mock / legacy):
+        datacube_client=None → imports GEE fetchers (Sentinel2Fetcher, CHIRPSFetcher).
+
+    Datacube mode (production):
+        datacube_client=<DatacubeClient> → reads from TimescaleDB cache that
+        was populated by Sentinel2STACFetcher + Sentinel1STACFetcher before
+        this processor is called. No GEE imports required.
     """
 
     def __init__(
@@ -107,17 +120,19 @@ class PolygonProcessor:
         use_ndvi: bool = True,
         use_sar: bool = True,
         fallback_to_climatology: bool = True,
+        datacube_client=None,          # DatacubeClient | None
     ):
         self.use_rainfall = use_rainfall
         self.use_ndvi     = use_ndvi
         self.use_sar      = use_sar
         self.fallback     = fallback_to_climatology
+        self.datacube     = datacube_client   # None → GEE path
         self.settings     = get_settings()
 
-        self.rain_det     = RainfallOnsetDetector()
-        self.ndvi_det     = NDVIGreenupDetector()
-        self.sar_det      = SARTillageDetector()
-        self.ensemble     = PlantingDateEnsemble()
+        self.rain_det  = RainfallOnsetDetector()
+        self.ndvi_det  = NDVIGreenupDetector()
+        self.sar_det   = SARTillageDetector()
+        self.ensemble  = PlantingDateEnsemble()
 
     def process(
         self,
@@ -152,31 +167,63 @@ class PolygonProcessor:
         search_start       = season_window.get_search_start(year)
         fetch_start        = search_start - timedelta(days=60)  # extra for baseline
 
+        # Crop-specific parameters (used by NDVI detector for planting offset)
+        crop_config: CropConfig = get_crop_config(polygon.crop_type or "maize")
+
         # ── Fetch ──────────────────────────────────────────────────────────────
         ndvi_obs: list[NDVIObservation] = []
         sar_obs:  list[SARObservation]  = []
         rainfall: list[RainfallRecord]  = []
 
-        if self.use_ndvi:
-            try:
-                from app.data.sentinel2 import Sentinel2Fetcher
-                ndvi_obs = Sentinel2Fetcher().fetch(polygon, fetch_start, win_end)
-            except Exception as e:
-                logger.warning(f"S2 fetch failed {polygon.polygon_id}: {e}")
+        if self.datacube is not None:
+            # ── Datacube path: read from TimescaleDB cache ─────────────────────
+            # STAC fetchers already wrote to farm_indices before process() was called.
+            if self.use_ndvi:
+                try:
+                    ndvi_obs = self.datacube.get_ndvi_series(
+                        polygon.farm_uuid, fetch_start, win_end
+                    )
+                except Exception as e:
+                    logger.warning("NDVI cache read failed %s: %s", polygon.polygon_id, e)
 
-        if self.use_sar:
-            try:
-                from app.data.sentinel1 import Sentinel1Fetcher
-                sar_obs = Sentinel1Fetcher().fetch(polygon, fetch_start, win_end)
-            except Exception as e:
-                logger.warning(f"SAR fetch failed {polygon.polygon_id}: {e}")
+            if self.use_sar:
+                try:
+                    sar_obs = self.datacube.get_sar_series(
+                        polygon.farm_uuid, fetch_start, win_end
+                    )
+                except Exception as e:
+                    logger.warning("SAR cache read failed %s: %s", polygon.polygon_id, e)
 
-        if self.use_rainfall:
-            try:
-                from app.data.chirps import CHIRPSFetcher
-                rainfall = CHIRPSFetcher().fetch(polygon, fetch_start, win_end)
-            except Exception as e:
-                logger.warning(f"CHIRPS failed {polygon.polygon_id}: {e}")
+            if self.use_rainfall:
+                try:
+                    rainfall = self.datacube.get_climate_series(
+                        polygon.centroid_lat, polygon.centroid_lon, fetch_start, win_end
+                    )
+                except Exception as e:
+                    logger.warning("Climate fetch failed %s: %s", polygon.polygon_id, e)
+
+        else:
+            # ── GEE path: legacy / mock / validation ───────────────────────────
+            if self.use_ndvi:
+                try:
+                    from app.data.sentinel2 import Sentinel2Fetcher
+                    ndvi_obs = Sentinel2Fetcher().fetch(polygon, fetch_start, win_end)
+                except Exception as e:
+                    logger.warning("S2 GEE fetch failed %s: %s", polygon.polygon_id, e)
+
+            if self.use_sar:
+                try:
+                    from app.data.sentinel1 import Sentinel1Fetcher
+                    sar_obs = Sentinel1Fetcher().fetch(polygon, fetch_start, win_end)
+                except Exception as e:
+                    logger.warning("SAR GEE fetch failed %s: %s", polygon.polygon_id, e)
+
+            if self.use_rainfall:
+                try:
+                    from app.data.chirps import CHIRPSFetcher
+                    rainfall = CHIRPSFetcher().fetch(polygon, fetch_start, win_end)
+                except Exception as e:
+                    logger.warning("CHIRPS GEE fetch failed %s: %s", polygon.polygon_id, e)
 
         # ── Detect ─────────────────────────────────────────────────────────────
         rain_sig = (
@@ -184,7 +231,7 @@ class PolygonProcessor:
             if self.use_rainfall and rainfall else RainfallOnsetSignal(available=False)
         )
         ndvi_sig = (
-            self.ndvi_det.detect(ndvi_obs, season_window, year)
+            self.ndvi_det.detect(ndvi_obs, season_window, year, crop_config=crop_config)
             if self.use_ndvi and ndvi_obs else NDVIGreenupSignal(available=False)
         )
         # Pass NDVI peak date to SAR detector so it can extract SAR phenology at crop peak
@@ -201,15 +248,15 @@ class PolygonProcessor:
         conf_level = self.ensemble.confidence_level(confidence)
 
         # ── Data quality metadata ──────────────────────────────────────────────
-        expected_days     = (win_end - fetch_start).days + 1
-        chirps_complete   = min(1.0, len(rainfall) / expected_days) if rainfall else 0.0
-        max_ndvi_gap      = self.ndvi_det._max_gap(ndvi_obs, search_start, win_end) if ndvi_obs else 0
-        avg_cloud         = sum(o.cloud_cover_pct for o in ndvi_obs) / len(ndvi_obs) if ndvi_obs else 0.0
+        expected_days    = (win_end - fetch_start).days + 1
+        climate_complete = min(1.0, len(rainfall) / expected_days) if rainfall else 0.0
+        max_ndvi_gap     = self.ndvi_det._max_gap(ndvi_obs, search_start, win_end) if ndvi_obs else 0
+        avg_cloud        = sum(o.cloud_cover_pct for o in ndvi_obs) / len(ndvi_obs) if ndvi_obs else 0.0
 
         warnings = []
-        if max_ndvi_gap > 15:   warnings.append(f"Large NDVI gap: {max_ndvi_gap}d")
-        if avg_cloud > 40:      warnings.append(f"High avg cloud: {avg_cloud:.0f}%")
-        if chirps_complete < 0.8: warnings.append(f"Incomplete CHIRPS: {chirps_complete:.0%}")
+        if max_ndvi_gap > 15:      warnings.append(f"Large NDVI gap: {max_ndvi_gap}d")
+        if avg_cloud > 40:         warnings.append(f"High avg cloud: {avg_cloud:.0f}%")
+        if climate_complete < 0.8: warnings.append(f"Incomplete climate data: {climate_complete:.0%}")
         if conf_level == "UNCERTAIN": warnings.append("Very low confidence — field-verify")
 
         return SeasonResult(
@@ -235,7 +282,7 @@ class PolygonProcessor:
                 cloud_cover_pct=round(avg_cloud, 1),
                 ndvi_observations=len(ndvi_obs),
                 sar_observations=len(sar_obs),
-                chirps_completeness=round(chirps_complete, 3),
+                chirps_completeness=round(climate_complete, 3),
                 max_ndvi_gap_days=max_ndvi_gap,
                 data_warnings=warnings,
             ),

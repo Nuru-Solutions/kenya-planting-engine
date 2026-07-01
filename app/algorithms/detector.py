@@ -1,13 +1,19 @@
 """
 app/algorithms/detector.py
 
-Signal 1 – Rainfall Onset  (40%): CHIRPS daily, Modified Stern Algorithm
-Signal 2 – NDVI Greenup    (35%): Sentinel-2, Savitzky-Golay smoothed
-Signal 3 – SAR Tillage     (25%): Sentinel-1 VV/VH backscatter change
+Signal 1 – Rainfall Onset  (40%): Visual Crossing daily, Modified Stern Algorithm
+Signal 2 – NDVI Greenup    (35%): Sentinel-2 via STAC, Savitzky-Golay smoothed
+Signal 3 – SAR Tillage     (25%): Sentinel-1 VV/VH backscatter change via STAC
 
 The NDVI and SAR signals also extract full phenological profiles
 (peak NDVI, season length, NDVI integral, SAR at peak, raw time series)
 for direct consumption by the downstream crop identification pipeline.
+
+Crop-aware planting offset
+--------------------------
+NDVIGreenupDetector.detect() accepts an optional CropConfig parameter.
+The planting_offset_days is read from CropConfig (maize=12d, wheat=10d, etc.).
+Adding a new crop: add one entry to CROP_REGISTRY in config.py — no algorithm changes.
 """
 from __future__ import annotations
 import logging
@@ -16,7 +22,7 @@ from datetime import date, timedelta
 from typing import Optional
 
 from app.core.config import (
-    get_settings, AEZConfig, Season, SeasonWindow, ConfidenceLevel,
+    get_settings, AEZConfig, Season, SeasonWindow, ConfidenceLevel, CropConfig,
 )
 from app.core.models import (
     NDVIObservation, SARObservation, RainfallRecord,
@@ -117,20 +123,25 @@ class RainfallOnsetDetector:
 class NDVIGreenupDetector:
     """
     Planting date detection:
-      - Filter obs by cloud < 60%, pixel_count >= 5
+      - Filter obs by cloud < 60%, pixel_count >= 3 (10m S2, small farms)
       - Pre-season baseline NDVI (8 weeks before window)
       - Savitzky-Golay smoothing (falls back to moving average)
       - First confirmed NDVI rise > 0.08 above baseline
-      - Planting = greenup − 12 days (maize emergence offset)
+      - Planting = greenup − planting_offset_days (crop-specific, default 12)
 
     Phenological profile (crop ID pipeline):
       peak_ndvi, peak_date, senescence_date, season_length_days,
       ndvi_at_harvest, ndvi_integral, ndvi_rise_rate, ndvi_timeseries
+
+    Crop-aware offset
+    -----------------
+    Pass CropConfig to detect() to get the correct planting offset per crop.
+    Falls back to DEFAULT_PLANTING_OFFSET=12 if crop_config is None.
     """
 
-    PLANTING_OFFSET = 12   # days from greenup to planting (maize)
-    MIN_PIXELS      = 3    # was 5 — small farm polygons at 10m need a lower floor
-    MAX_CLOUD       = 60
+    DEFAULT_PLANTING_OFFSET = 12   # days from greenup to planting (maize default)
+    MIN_PIXELS              = 3
+    MAX_CLOUD               = 60
 
     def __init__(self):
         self.settings = get_settings()
@@ -140,7 +151,18 @@ class NDVIGreenupDetector:
         observations: list[NDVIObservation],
         season_window: SeasonWindow,
         year: int,
+        crop_config: Optional[CropConfig] = None,
     ) -> NDVIGreenupSignal:
+        """Detect NDVI greenup and estimate planting date.
+
+        Parameters
+        ----------
+        observations : list of NDVIObservation (from timeseries.farm_indices cache)
+        season_window : AEZ-specific season window
+        year : crop calendar year
+        crop_config : CropConfig for this farm (sets planting_offset_days).
+                      If None, falls back to DEFAULT_PLANTING_OFFSET (12 days, maize).
+        """
         if not observations:
             return NDVIGreenupSignal(available=False)
 
@@ -195,7 +217,12 @@ class NDVIGreenupDetector:
                 ndvi_timeseries=self._ts(in_win),
             )
 
-        estimated_planting = greenup_date - timedelta(days=self.PLANTING_OFFSET)
+        planting_offset = (
+            crop_config.planting_offset_days
+            if crop_config is not None
+            else self.DEFAULT_PLANTING_OFFSET
+        )
+        estimated_planting = greenup_date - timedelta(days=planting_offset)
 
         # ── Phenological profile ───────────────────────────────────────────────
         peak_idx  = smooth.index(max(smooth))
@@ -237,7 +264,7 @@ class NDVIGreenupDetector:
         return NDVIGreenupSignal(
             greenup_date=greenup_date,
             estimated_planting_date=estimated_planting,
-            planting_offset_days=self.PLANTING_OFFSET,
+            planting_offset_days=planting_offset,
             baseline_ndvi=round(baseline, 4),
             peak_ndvi=peak_ndvi,
             peak_date=peak_date,

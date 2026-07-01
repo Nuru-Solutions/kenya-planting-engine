@@ -26,15 +26,74 @@ class JobStatus(str, Enum):
 # ── Internal data models ───────────────────────────────────────────────────────
 
 class FarmPolygon(BaseModel):
-    polygon_id: str
+    """
+    Represents a single farm polygon being processed.
+
+    In GEE mode: polygon_id / fid / county / ward come from a GeoJSON file.
+    In Datacube mode: farm_uuid, tile_id, crop_type are populated from the DB;
+    polygon_id is set to farm_uuid for downstream compatibility.
+    """
+    polygon_id: str                            # Primary key used throughout pipeline
     fid: Optional[int] = None
+
+    # Location / admin
     county: Optional[str] = None
     ward: Optional[str] = None
-    aez_code: Optional[float] = None
-    geometry: Dict[str, Any]
+    aez_code: Optional[str] = None
+
+    # Geometry
+    geometry: Dict[str, Any]                   # GeoJSON geometry dict
+    geom_wkt: Optional[str] = None             # WKT string (from DB ST_AsText)
     centroid_lat: float
     centroid_lon: float
     area_ha: Optional[float] = None
+
+    # ── Datacube fields (populated when reading from farm_intelligence) ────────
+    farm_uuid: Optional[str] = None            # UUID PK from spatial.farms
+    tile_id: Optional[str] = None             # Sentinel-2 MGRS tile (e.g. '37MBU')
+    crop_type: Optional[str] = None           # Set by Stage 3 classifier
+
+
+class FarmRow(BaseModel):
+    """
+    Output of DatacubeClient.get_eligible_farms().
+    One row per farm eligible for planting date detection.
+    Direct mapping from the JOIN of spatial.farms + spatial.farm_intelligence.
+    """
+    farm_uuid: str
+    geom_wkt: str                              # ST_AsText(f.geom)
+    tile_id: str
+    aez_code: Optional[str] = None        # DB text code e.g. LH 3
+    county_code: Optional[str] = None
+    ward_code: Optional[str] = None
+    crop_type: str
+    centroid_lat: float
+    centroid_lon: float
+    area_ha: Optional[float] = None
+
+    def to_farm_polygon(self) -> FarmPolygon:
+        """Convert DB row into the FarmPolygon the pipeline expects."""
+        import json
+        from shapely import wkt as shapely_wkt
+        geom = shapely_wkt.loads(self.geom_wkt)
+        geojson_geom = {
+            "type": geom.geom_type,
+            "coordinates": list(geom.__geo_interface__["coordinates"]),
+        }
+        return FarmPolygon(
+            polygon_id=self.farm_uuid,
+            farm_uuid=self.farm_uuid,
+            tile_id=self.tile_id,
+            crop_type=self.crop_type,
+            county=self.county_code,
+            ward=self.ward_code,
+            aez_code=self.aez_code,
+            geometry=geojson_geom,
+            geom_wkt=self.geom_wkt,
+            centroid_lat=self.centroid_lat,
+            centroid_lon=self.centroid_lon,
+            area_ha=self.area_ha,
+        )
 
 
 class NDVIObservation(BaseModel):
@@ -57,7 +116,7 @@ class SARObservation(BaseModel):
 class RainfallRecord(BaseModel):
     record_date: date
     rainfall_mm: float
-    source: str = "CHIRPS"
+    source: str = "VisualCrossing"
 
 
 # ── Detection signal outputs ───────────────────────────────────────────────────
@@ -148,7 +207,7 @@ class SeasonResult(BaseModel):
     fid: Optional[int] = None
     county: Optional[str] = None
     ward: Optional[str] = None
-    aez_code: Optional[float] = None
+    aez_code: Optional[str] = None
     aez_zone_name: Optional[str] = None
     season: str
     year: int
@@ -188,7 +247,7 @@ class FarmSeasonHistory(BaseModel):
     fid: Optional[int] = None
     county: Optional[str] = None
     ward: Optional[str] = None
-    aez_code: Optional[float] = None
+    aez_code: Optional[str] = None
     aez_zone_name: Optional[str] = None
     geometry: Optional[Dict[str, Any]] = None
     centroid_lat: Optional[float] = None

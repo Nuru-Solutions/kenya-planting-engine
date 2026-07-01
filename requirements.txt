@@ -1,11 +1,27 @@
-earthengine-api>=0.1.399
+# ── Datacube (Stage 4 primary stack) ─────────────────────────────────────────
+psycopg2-binary>=2.9.9         # PostGIS / TimescaleDB connection pool
+pystac-client>=0.7.5           # STAC API queries (Element84 Earth Search)
+rasterio>=1.3.9                # COG HTTP range reads for Sentinel-2 and Sentinel-1
+shapely>=2.0.0                 # Geometry WKT parsing, bounding boxes
+requests>=2.31.0               # Visual Crossing climate API
+
+# ── Core ────────────────────────────────────────────────────────────────────
 pydantic>=2.7.1
 pydantic-settings>=2.3.1
-scipy>=1.14.0
+scipy>=1.14.0                  # Savitzky-Golay NDVI smoothing
 numpy>=2.0.0
 pandas>=2.2.2
-pytest>=8.2.2
-pytest-asyncio>=0.23.7
+
+# ── API / serving ───────────────────────────────────────────────────────────
 fastapi>=0.111.0
 uvicorn[standard]>=0.30.1
+
+# ── AWS ─────────────────────────────────────────────────────────────────────
 boto3>=1.34.0
+
+# ── Testing ─────────────────────────────────────────────────────────────────
+pytest>=8.2.2
+pytest-asyncio>=0.23.7
+
+# ── GEE (kept for legacy --mock path + accuracy validation vs Datacube) ─────
+earthengine-api>=0.1.399

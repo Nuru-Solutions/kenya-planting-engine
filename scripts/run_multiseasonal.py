@@ -344,22 +344,26 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Full run with default years (2024 + 2025)
+  # Full run with default years (2024 + 2025)  [GEE path]
   python scripts/run_multiseasonal.py
+
+  # Datacube path (STAC + Visual Crossing — no GEE)
+  python scripts/run_multiseasonal.py --datacube --years 2025 --seasons long_rains
+
+  # Side-by-side accuracy validation
+  python scripts/run_multiseasonal.py --datacube --limit 50 --years 2025 --seasons long_rains
+  python scripts/run_multiseasonal.py          --limit 50 --years 2025 --seasons long_rains
 
   # Test without GEE (mock data)
   python scripts/run_multiseasonal.py --mock
 
   # Custom years
   python scripts/run_multiseasonal.py --years 2023 2024 2025
-
-  # Only long rains
-  python scripts/run_multiseasonal.py --seasons long_rains
-
-  # 5 polygons only (test)
-  python scripts/run_multiseasonal.py --mock --limit 5
         """,
     )
+    parser.add_argument("--datacube", action="store_true",
+                        help="Use Datacube path (STAC + Visual Crossing + TimescaleDB cache). "
+                             "Loads farms from spatial.farm_intelligence instead of --input GeoJSON.")
     parser.add_argument("--input",   "-i", default="digifarms_with_aez.geojson")
     parser.add_argument("--outdir",  "-o", default="outputs")
     parser.add_argument("--years",   "-y", nargs="+", type=int,
@@ -377,11 +381,11 @@ Examples:
     parser.add_argument("--no-ndvi",     action="store_true")
     parser.add_argument("--no-sar",      action="store_true")
     parser.add_argument("--workers",  "-w", type=int, default=8,
-                        help="Parallel GEE threads for live mode (default: 8)")
+                        help="Parallel threads (default: 8)")
     parser.add_argument("--no-cache", action="store_true",
-                        help="Bypass disk cache — always fetch fresh from GEE")
+                        help="Bypass disk cache — always fetch fresh from GEE (GEE path only)")
     parser.add_argument("--clear-cache", action="store_true",
-                        help="Delete all cached GEE observations before running")
+                        help="Delete all cached GEE observations before running (GEE path only)")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
@@ -472,6 +476,84 @@ Examples:
 
     if args.mock:
         job = run_mock(geojson, all_runs, args.polygon_ids)
+    elif getattr(args, "datacube", False):
+        # ── Datacube path (STAC + Visual Crossing + TimescaleDB) ────────────────
+        from app.data.datacube_client import DatacubeClient
+        from app.data.stac_fetcher import Sentinel2STACFetcher, Sentinel1STACFetcher
+        from app.core.pipeline import resolve_season, PolygonProcessor
+        from app.core.config import get_aez_config
+        from collections import defaultdict
+        import threading
+
+        dc = DatacubeClient()
+        limit = args.limit or 10000
+        farms = dc.get_eligible_farms(batch_size=limit)
+        if args.polygon_ids:
+            farms = [f for f in farms if f.farm_uuid in args.polygon_ids]
+
+        tile_groups = dc.group_by_tile(farms)
+        logger = logging.getLogger("run_multiseasonal")
+        logger.info("Datacube mode: %d farms in %d tiles", len(farms), len(tile_groups))
+
+        from app.core.models import FarmSeasonHistory, MultiSeasonJobResult, JobStatus
+        all_histories = []
+
+        for tile_id, tile_farms in tile_groups.items():
+            tile_pairs = [(f.farm_uuid, f.geom_wkt) for f in tile_farms]
+            for run in all_runs:
+                yr, sname = run["year"], run["season"]
+                aez_s = get_aez_config(tile_farms[0].aez_code)
+                _, w = resolve_season(sname, yr, aez_s)
+                from datetime import timedelta
+                fetch_start = w.get_search_start(yr) - timedelta(days=60)
+                _, win_end  = w.get_window(yr)
+
+                c_s2 = dc._pool.getconn()
+                try:
+                    Sentinel2STACFetcher(c_s2).fetch_for_tile(tile_id, tile_pairs, fetch_start, win_end)
+                finally:
+                    dc._pool.putconn(c_s2)
+
+                c_s1 = dc._pool.getconn()
+                try:
+                    Sentinel1STACFetcher(c_s1).fetch_for_tile(tile_id, tile_pairs, fetch_start, win_end)
+                finally:
+                    dc._pool.putconn(c_s1)
+
+            for farm in tile_farms:
+                hist = FarmSeasonHistory(
+                    polygon_id=farm.farm_uuid,
+                    county=farm.county_code, ward=farm.ward_code,
+                    aez_code=farm.aez_code,
+                    centroid_lat=farm.centroid_lat, centroid_lon=farm.centroid_lon,
+                    area_ha=farm.area_ha,
+                )
+                poly = farm.to_farm_polygon()
+                aez  = get_aez_config(farm.aez_code)
+                proc = PolygonProcessor(
+                    use_rainfall=not args.no_rainfall,
+                    use_ndvi=not args.no_ndvi,
+                    use_sar=not args.no_sar,
+                    fallback_to_climatology=True,
+                    datacube_client=dc,
+                )
+                for run in all_runs:
+                    s, w = resolve_season(run["season"], run["year"], aez)
+                    hist.seasons.append(proc.process(poly, s, w, aez, run["year"]))
+                all_histories.append(hist)
+
+        ok  = sum(1 for h in all_histories for s in h.seasons if not s.error)
+        err = sum(1 for h in all_histories for s in h.seasons if s.error)
+        job = MultiSeasonJobResult(
+            status=JobStatus.COMPLETED if err == 0 else JobStatus.PARTIAL,
+            years_processed=sorted(set(r["year"]   for r in all_runs)),
+            seasons_processed=sorted(set(r["season"] for r in all_runs)),
+            total_polygons=len(all_histories),
+            total_tasks=len(all_histories) * len(all_runs),
+            succeeded=ok, failed=err,
+            farm_histories=all_histories,
+        )
+        dc.close()
     else:
         job = run_live(
             geojson, all_runs, args.polygon_ids,

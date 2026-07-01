@@ -1,15 +1,22 @@
 """
 app/core/config.py
-Kenya AEZ season calendar and application settings.
+Kenya AEZ season calendar, crop registry, and application settings.
 """
 from __future__ import annotations
+import logging
+import os
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from enum import Enum
-from typing import Optional
 from functools import lru_cache
+from typing import Optional
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+logger = logging.getLogger(__name__)
+
+
+# ── Season & AEZ enums/dataclasses ─────────────────────────────────────────────
 
 class Season(str, Enum):
     LONG_RAINS   = "long_rains"
@@ -78,7 +85,6 @@ class AEZConfig:
 
 
 # ── Kenya AEZ Registry ─────────────────────────────────────────────────────────
-# Covers AEZ codes in your digifarms data: 33, 44, 46, 99
 
 KENYA_AEZ_REGISTRY: dict[float, AEZConfig] = {
 
@@ -92,7 +98,7 @@ KENYA_AEZ_REGISTRY: dict[float, AEZConfig] = {
         ],
         typical_crops=["Maize", "Wheat", "Barley", "Beans"],
         notes="Nakuru highlands. Reliable bimodal. 1500–2000mm/yr.",
-        signal_weights=(0.30, 0.50, 0.20),  # NDVI-dominant ensemble
+        signal_weights=(0.30, 0.50, 0.20),
     ),
 
     44.0: AEZConfig(
@@ -105,7 +111,7 @@ KENYA_AEZ_REGISTRY: dict[float, AEZConfig] = {
         ],
         typical_crops=["Maize", "Sorghum", "Beans", "Green Gram"],
         notes="Kajiado semi-arid. 500–900mm/yr.",
-        signal_weights=(0.35, 0.45, 0.20),  # still rainfall-biased but higher NDVI weight
+        signal_weights=(0.35, 0.45, 0.20),
     ),
 
     46.0: AEZConfig(
@@ -118,7 +124,7 @@ KENYA_AEZ_REGISTRY: dict[float, AEZConfig] = {
         ],
         typical_crops=["Sorghum", "Cowpea", "Green Gram"],
         notes="300–600mm/yr. SAR most reliable here.",
-        signal_weights=(0.35, 0.35, 0.30),  # keep SAR important but not dominant
+        signal_weights=(0.35, 0.35, 0.30),
     ),
 
     99.0: AEZConfig(
@@ -133,7 +139,7 @@ KENYA_AEZ_REGISTRY: dict[float, AEZConfig] = {
         has_third_season=True,
         typical_crops=["Maize", "Irish Potato", "Wheat", "Pyrethrum"],
         notes=">2000mm/yr. Cool highlands. Third season possible.",
-        signal_weights=(0.25, 0.45, 0.30),  # favor NDVI but retain SAR support
+        signal_weights=(0.25, 0.45, 0.30),
     ),
 }
 
@@ -147,8 +153,56 @@ DEFAULT_AEZ = AEZConfig(
 )
 
 
-def get_aez_config(aez_code: float) -> AEZConfig:
-    return KENYA_AEZ_REGISTRY.get(aez_code, DEFAULT_AEZ)
+# ── AEZ string code → numeric registry key ────────────────────────────────────
+# DB stores text codes like "LH 3", "UH 2"; GeoJSON stores numeric like 33.0.
+# This mapper bridges both. Coverage follows Kenya AEZ classification.
+# LH = Lower Highlands, UH = Upper Highlands, UM = Upper Midland, LM = Lower Midland
+_AEZ_TEXT_TO_CODE: dict[str, float] = {
+    # Upper & Lower Highlands → Highland config (99.0)
+    "UH 1": 99.0, "UH 2": 99.0, "UH 3": 99.0,
+    "LH 1": 99.0, "LH 2": 99.0, "LH 3": 99.0,
+    "LH 4": 99.0, "LH 5": 99.0,
+    # Upper Midland 1-3 → UM3 config (33.0)
+    "UM 1": 33.0, "UM 2": 33.0, "UM 3": 33.0,
+    # Upper Midland 4-6 → semi-arid configs
+    "UM 4": 44.0, "UM 5": 44.0, "UM 6": 46.0,
+    # Lower Midland → LM configs
+    "LM 1": 44.0, "LM 2": 44.0, "LM 3": 44.0,
+    "LM 4": 46.0, "LM 5": 46.0,
+    # Inland / Coastal Lowlands → semi-arid
+    "IL 1": 46.0, "IL 2": 46.0, "IL 3": 46.0,
+    "IL 4": 46.0, "IL 5": 46.0, "IL 6": 46.0,
+    "CL 1": 46.0, "CL 2": 46.0, "CL 3": 46.0,
+    "CL 4": 46.0, "CL 5": 46.0,
+}
+
+
+def get_aez_config(aez_code) -> AEZConfig:
+    """
+    Accepts either:
+      - float  : 33.0, 44.0, 46.0, 99.0  (GeoJSON / legacy path)
+      - str    : 'LH 3', 'UH 2', 'UM 6'  (DB path, spatial.farms.aez_code)
+      - None   : falls back to DEFAULT_AEZ
+
+    Falls back to DEFAULT_AEZ if the code is unknown in either format.
+    """
+    if aez_code is None:
+        return DEFAULT_AEZ
+
+    # String code path (DB)
+    if isinstance(aez_code, str):
+        numeric = _AEZ_TEXT_TO_CODE.get(aez_code.strip().upper())
+        if numeric is None:
+            logger.warning("Unknown AEZ text code '%s' — falling back to DEFAULT_AEZ", aez_code)
+            return DEFAULT_AEZ
+        return KENYA_AEZ_REGISTRY.get(numeric, DEFAULT_AEZ)
+
+    # Numeric path (GeoJSON / legacy)
+    try:
+        return KENYA_AEZ_REGISTRY.get(float(aez_code), DEFAULT_AEZ)
+    except (TypeError, ValueError):
+        logger.warning("Cannot parse aez_code '%s' — falling back to DEFAULT_AEZ", aez_code)
+        return DEFAULT_AEZ
 
 
 def build_season_run_list(years: list[int], include_third_season: bool = False) -> list[dict]:
@@ -166,38 +220,126 @@ def build_season_run_list(years: list[int], include_third_season: bool = False) 
     return runs
 
 
+# ── Crop Registry ──────────────────────────────────────────────────────────────
+# Maize-first. Adding a new crop = one config entry, zero algorithm changes.
+# The planting engine reads crop_type from spatial.farm_intelligence (set by
+# Stage 3 classifier) and looks up parameters here.
+
+@dataclass
+class CropConfig:
+    crop_type: str
+    planting_offset_days: int          # days from NDVI greenup to planting
+    min_season_length_days: int        # shortest viable crop cycle
+    max_season_length_days: int        # longest viable crop cycle
+    signal_weight_override: Optional[tuple] = None  # (rain, ndvi, sar) — None = AEZ default
+    peak_ndvi_expected_range: tuple = (0.30, 0.90)  # (min, max) quality guard
+    scl_min_valid_fraction: float = 0.50            # mirrors Stage 3 MIN_VALID_PIXEL_FRACTION
+    notes: str = ""
+
+
+CROP_REGISTRY: dict[str, CropConfig] = {
+    "maize": CropConfig(
+        crop_type="maize",
+        planting_offset_days=12,
+        min_season_length_days=75,
+        max_season_length_days=130,
+        signal_weight_override=None,
+        peak_ndvi_expected_range=(0.45, 0.85),
+        notes="Primary crop. Bimodal LR + SR. NDVI-dominant in highlands.",
+    ),
+    # ── Future crops — uncomment + tune when Stage 3 classifier supports them ──
+    # "wheat": CropConfig(
+    #     "wheat", planting_offset_days=10, min_season_length_days=90,
+    #     max_season_length_days=150, peak_ndvi_expected_range=(0.40, 0.80),
+    # ),
+    # "sorghum": CropConfig(
+    #     "sorghum", planting_offset_days=14, min_season_length_days=90,
+    #     max_season_length_days=160, signal_weight_override=(0.40, 0.35, 0.25),
+    #     peak_ndvi_expected_range=(0.30, 0.70),
+    #     notes="SAR more reliable in semi-arid zones.",
+    # ),
+    # "beans": CropConfig(
+    #     "beans", planting_offset_days=8, min_season_length_days=55,
+    #     max_season_length_days=90, peak_ndvi_expected_range=(0.30, 0.65),
+    # ),
+    # "potato": CropConfig(
+    #     "potato", planting_offset_days=7, min_season_length_days=80,
+    #     max_season_length_days=120, peak_ndvi_expected_range=(0.40, 0.75),
+    # ),
+    # "cowpea": CropConfig(
+    #     "cowpea", planting_offset_days=10, min_season_length_days=60,
+    #     max_season_length_days=100, signal_weight_override=(0.35, 0.35, 0.30),
+    #     peak_ndvi_expected_range=(0.25, 0.60),
+    # ),
+}
+
+
+def get_crop_config(crop_type: str) -> CropConfig:
+    """
+    Case-insensitive lookup. Falls back to maize defaults if crop unknown.
+    To add a new crop: uncomment its entry in CROP_REGISTRY above — zero code changes.
+    """
+    ct = (crop_type or "maize").strip().lower()
+    if ct not in CROP_REGISTRY:
+        logger.warning("Unknown crop_type '%s' — falling back to maize CropConfig", ct)
+    return CROP_REGISTRY.get(ct, CROP_REGISTRY["maize"])
+
+
 # ── Application Settings ───────────────────────────────────────────────────────
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    # GEE — pre-configured for your service account
-    gee_service_account: str = "precisionfarms@serene-bastion-406504.iam.gserviceaccount.com"
-    gee_credentials_path: str = "secrets/gee-credentials.json"
-
-    # API
+    # ── API ────────────────────────────────────────────────────────────────────
     api_key: str = "precisionfarms-dev-key"
     api_port: int = 8000
 
-    # Detection thresholds
-    max_cloud_cover: int = 70
+    # ── Detection thresholds ───────────────────────────────────────────────────
+    max_cloud_cover: int = 80                # scene-level STAC filter; SCL handles per-pixel
     rainfall_onset_threshold_mm: float = 25.0
     ndvi_greenup_threshold: float = 0.08
     sar_tillage_threshold_db: float = -1.5
-    # Confidence thresholds — calibrated for small tropical farm polygons.
-    # Small EAK farms in cloudy seasons rarely exceed 0.65 via RS alone;
-    # 0.60 HIGH / 0.20 UNCERTAIN floor reflects achievable ground truth.
-    high_confidence_score: float = 0.60   # was 0.70
-    min_confidence_score: float = 0.20    # was 0.30 (UNCERTAIN floor)
+    high_confidence_score: float = 0.60
+    min_confidence_score: float = 0.20
     ndvi_smoothing_window: int = 5
     rainfall_false_start_days: int = 14
 
-    # Signal weights
+    # ── Signal weights (global defaults; AEZ + crop configs can override) ──────
     weight_rainfall: float = 0.40
     weight_ndvi: float = 0.35
     weight_sar: float = 0.25
 
-    # AWS / S3
+    # ── PostGIS / TimescaleDB ──────────────────────────────────────────────────
+    # Mirrors Stage 1 (postgis_export.py) and Stage 3 (db_client.py) env var names.
+    postgis_host: str = "localhost"
+    postgis_host_private: str = ""          # Used inside AWS Batch/ECS (private VPC IP)
+    postgis_port: int = 5433                # 5433 = SSH tunnel (dev); 5432 = VPC (prod)
+    postgis_db: str = "nuru_datacube"
+    postgis_user: str = "postgres"
+    postgis_password: str = ""
+    postgis_pool_min: int = 2
+    postgis_pool_max: int = 10
+
+    # ── STAC (Element84 Earth Search) ──────────────────────────────────────────
+    stac_api_url: str = "https://earth-search.aws.element84.com/v1"
+    stac_s2_collection: str = "sentinel-2-l2a"
+    stac_s1_collection: str = "sentinel-1-grd"
+    stac_max_cloud_cover_scene: int = 80    # loose scene filter; SCL does per-pixel masking
+    stac_max_items_per_tile: int = 20
+
+    # ── SCL cloud masking (mirrors Stage 3 stac_patch_fetcher.py) ─────────────
+    scl_min_valid_fraction: float = 0.50    # min fraction of valid SCL pixels to use a timestep
+    scl_min_valid_timesteps: int = 4        # min clear scenes to compute planting date
+
+    # ── Visual Crossing climate ────────────────────────────────────────────────
+    visual_crossing_api_key: str = ""
+    visual_crossing_base_url: str = (
+        "https://weather.visualcrossing.com/VisualCrossingWebServices"
+        "/rest/services/timeline"
+    )
+    climate_grid_resolution: float = 0.02  # degrees (~2 km snap for climate_daily grid_id)
+
+    # ── AWS / S3 ───────────────────────────────────────────────────────────────
     s3_bucket: str = ""
     aws_region: str = "eu-north-1"
     aws_access_key_id: str = ""
