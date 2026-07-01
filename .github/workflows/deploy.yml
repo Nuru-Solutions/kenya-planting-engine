@@ -1,0 +1,177 @@
+# ── Stage 4: Kenya Planting Engine — CI/CD ────────────────────────────────────
+#
+# Job 1  test           Runs on every push and every PR to any branch.
+#                       Installs deps, runs pytest.
+#
+# Job 2  build-deploy   Runs on push to `master` ONLY (after `test` passes).
+#                       Builds the Docker image, pushes to ECR with two tags:
+#                         • latest
+#                         • git-<short-sha>  (immutable, used in Job Definition)
+#                       Registers a new AWS Batch Job Definition revision pointing
+#                       at the git-sha tag so Batch always runs the exact commit
+#                       that passed CI.
+#
+# Required GitHub repo secrets (Settings → Secrets → Actions):
+#   AWS_ACCESS_KEY_ID       IAM key with ECR push + Batch RegisterJobDefinition
+#   AWS_SECRET_ACCESS_KEY   Matching secret
+#   POSTGIS_PASSWORD        DB password injected into Job Definition env vars
+#   VISUAL_CROSSING_API_KEY Climate API key injected into Job Definition env vars
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Stage 4 — Planting Engine CI/CD
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["master"]
+
+env:
+  AWS_REGION:      eu-north-1
+  ECR_REGISTRY:    741448918017.dkr.ecr.eu-north-1.amazonaws.com
+  ECR_REPOSITORY:  kenya-planting-engine
+  # Batch resources (must match terraform/main.tf)
+  BATCH_JOB_DEF:   nuru-stage4-planting-engine
+  BATCH_JOB_QUEUE: cpu_job_queue
+
+# ── Job 1: Test ───────────────────────────────────────────────────────────────
+jobs:
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # Install GDAL system dependency (required by rasterio)
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libgdal-dev gdal-bin libpq-dev gcc
+
+      - name: Install Python dependencies
+        run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Run pytest
+        run: pytest tests/ -v --tb=short
+        env:
+          # Point tests at a throwaway config so pydantic-settings doesn't fail
+          POSTGIS_HOST:     localhost
+          POSTGIS_DB:       test_db
+          POSTGIS_USER:     postgres
+          POSTGIS_PASSWORD: test
+          VISUAL_CROSSING_API_KEY: ""
+
+# ── Job 2: Build & Deploy ─────────────────────────────────────────────────────
+  build-deploy:
+    name: Build → ECR → Batch Job Definition
+    needs: test
+    # Only run on direct pushes to master (not PRs)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Short SHA used as the immutable image tag (e.g. git-a3f2c1d)
+      - name: Derive image tag
+        id: meta
+        run: echo "sha_tag=git-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      # ── AWS auth ─────────────────────────────────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── Docker build & push ──────────────────────────────────────────────────
+      - name: Build Docker image
+        run: |
+          docker build \
+            --tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.sha_tag }} \
+            --tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest \
+            --label "git.sha=${{ github.sha }}" \
+            --label "git.ref=${{ github.ref }}" \
+            --label "build.date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            .
+
+      - name: Push image to ECR (sha tag + latest)
+        run: |
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.sha_tag }}
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+
+      # ── Register new Batch Job Definition revision ────────────────────────────
+      # We point the revision at the immutable git-sha tag, not :latest,
+      # so every Batch run is pinned to the exact commit that passed CI.
+      - name: Register Batch Job Definition revision
+        id: register-job-def
+        run: |
+          REVISION=$(aws batch register-job-definition \
+            --job-definition-name "${{ env.BATCH_JOB_DEF }}" \
+            --type container \
+            --platform-capabilities EC2 \
+            --container-properties "$(cat <<EOF
+          {
+            "image": "${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.sha_tag }}",
+            "resourceRequirements": [
+              { "type": "VCPU",   "value": "4"     },
+              { "type": "MEMORY", "value": "16384"  }
+            ],
+            "executionRoleArn": "arn:aws:iam::741448918017:role/ecsTaskExecutionRole",
+            "jobRoleArn":       "arn:aws:iam::741448918017:role/CropTypeClassification-Batch-Role",
+            "environment": [
+              { "name": "POSTGIS_HOST",             "value": "10.0.101.32" },
+              { "name": "POSTGIS_HOST_PRIVATE",     "value": "10.0.101.32" },
+              { "name": "POSTGIS_PORT",             "value": "5432" },
+              { "name": "POSTGIS_DB",               "value": "postgres" },
+              { "name": "POSTGIS_USER",             "value": "postgres" },
+              { "name": "POSTGIS_PASSWORD",         "value": "${{ secrets.POSTGIS_PASSWORD }}" },
+              { "name": "VISUAL_CROSSING_API_KEY",  "value": "${{ secrets.VISUAL_CROSSING_API_KEY }}" },
+              { "name": "S3_BUCKET",                "value": "nuru-datacube-prod-storage" },
+              { "name": "AWS_REGION",               "value": "eu-north-1" }
+            ],
+            "logConfiguration": {
+              "logDriver": "awslogs",
+              "options": {
+                "awslogs-group":         "/aws/batch/nuru-stage4-planting-engine",
+                "awslogs-region":        "eu-north-1",
+                "awslogs-stream-prefix": "batch"
+              }
+            }
+          }
+          EOF
+          )" \
+            --query "jobDefinitionArn" \
+            --output text)
+
+          echo "job_definition_arn=$REVISION" >> $GITHUB_OUTPUT
+          echo "✅ Registered: $REVISION"
+
+      # ── Summary ───────────────────────────────────────────────────────────────
+      - name: Write job summary
+        run: |
+          echo "## 🌱 Stage 4 Planting Engine Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image tag** | \`${{ steps.meta.outputs.sha_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **ECR image** | \`${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.sha_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Batch Job Def** | \`${{ steps.register-job-def.outputs.job_definition_arn }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Queue** | \`${{ env.BATCH_JOB_QUEUE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **EventBridge cron** | every 6 hours |" >> $GITHUB_STEP_SUMMARY
