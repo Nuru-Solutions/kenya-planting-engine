@@ -457,6 +457,7 @@ class Sentinel1STACFetcher:
         self._client  = Client.open(self.settings.stac_api_url)
         self._s3      = boto3.client("s3")
         self._s3_exists_cache: Dict[str, bool] = {}
+        self._s3_error_reasons: Dict[str, int] = {}
 
     def _resolve_existing_asset_href(self, asset_href: str) -> Optional[str]:
         """
@@ -479,8 +480,16 @@ class Sentinel1STACFetcher:
                     bucket, key = bucket_key.split("/", 1)
                     self._s3.head_object(Bucket=bucket, Key=key, RequestPayer="requester")
                     exists = True
-                except (ValueError, ClientError, Exception):
+                except ValueError:
                     exists = False
+                    self._s3_error_reasons["InvalidS3Uri"] = self._s3_error_reasons.get("InvalidS3Uri", 0) + 1
+                except ClientError as exc:
+                    exists = False
+                    code = exc.response.get("Error", {}).get("Code", "ClientError")
+                    self._s3_error_reasons[code] = self._s3_error_reasons.get(code, 0) + 1
+                except Exception:
+                    exists = False
+                    self._s3_error_reasons["UnknownError"] = self._s3_error_reasons.get("UnknownError", 0) + 1
 
             self._s3_exists_cache[href] = exists
             if exists:
@@ -548,7 +557,7 @@ class Sentinel1STACFetcher:
             resolved_vv = self._resolve_existing_asset_href(vv_asset.href)
             if not resolved_vv:
                 skipped_items += 1
-                logger.warning("S1 item %s skipped: VV asset unavailable", item.id)
+                logger.debug("S1 item %s skipped: VV asset unavailable", item.id)
                 continue
 
             vv_asset.href = resolved_vv
@@ -560,9 +569,12 @@ class Sentinel1STACFetcher:
             usable_items.append(item)
 
         if skipped_items:
+            reason_str = ", ".join(
+                f"{k}={v}" for k, v in sorted(self._s3_error_reasons.items(), key=lambda x: -x[1])
+            ) or "unknown"
             logger.warning(
-                "S1 tile=%s skipped %d/%d scenes due to unavailable assets",
-                tile_id, skipped_items, len(items)
+                "S1 tile=%s skipped %d/%d scenes due to unavailable assets (reasons: %s)",
+                tile_id, skipped_items, len(items), reason_str
             )
         if not usable_items:
             logger.warning("S1: No usable scenes for tile %s after asset checks", tile_id)
