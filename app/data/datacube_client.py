@@ -93,6 +93,48 @@ ORDER  BY observation_date
 """
 
 _UPSERT_PLANTING_SQL = """
+WITH incoming (
+    farm_uuid,
+    planting_date,
+    planting_season,
+    planting_year,
+    planting_confidence,
+    planting_confidence_level,
+    planting_method,
+    peak_ndvi,
+    peak_ndvi_date,
+    senescence_date,
+    season_length_days,
+    ndvi_integral,
+    ndvi_rise_rate,
+    total_rainfall_mm,
+    planting_processed_at,
+    updated_at
+) AS (
+    VALUES %s
+),
+updated AS (
+    UPDATE spatial.farm_intelligence fi
+    SET
+        planting_date             = i.planting_date,
+        planting_season           = i.planting_season,
+        planting_year             = i.planting_year,
+        planting_confidence       = i.planting_confidence,
+        planting_confidence_level = i.planting_confidence_level,
+        planting_method           = i.planting_method,
+        peak_ndvi                 = i.peak_ndvi,
+        peak_ndvi_date            = i.peak_ndvi_date,
+        senescence_date           = i.senescence_date,
+        season_length_days        = i.season_length_days,
+        ndvi_integral             = i.ndvi_integral,
+        ndvi_rise_rate            = i.ndvi_rise_rate,
+        total_rainfall_mm         = i.total_rainfall_mm,
+        planting_processed_at     = i.planting_processed_at,
+        updated_at                = i.updated_at
+    FROM incoming i
+    WHERE fi.farm_uuid = i.farm_uuid
+    RETURNING fi.farm_uuid
+)
 INSERT INTO spatial.farm_intelligence (
     farm_uuid,
     planting_date,
@@ -111,23 +153,29 @@ INSERT INTO spatial.farm_intelligence (
     planting_processed_at,
     updated_at
 )
-VALUES %s
-ON CONFLICT (farm_uuid) DO UPDATE SET
-    planting_date             = EXCLUDED.planting_date,
-    planting_season           = EXCLUDED.planting_season,
-    planting_year             = EXCLUDED.planting_year,
-    planting_confidence       = EXCLUDED.planting_confidence,
-    planting_confidence_level = EXCLUDED.planting_confidence_level,
-    planting_method           = EXCLUDED.planting_method,
-    peak_ndvi                 = EXCLUDED.peak_ndvi,
-    peak_ndvi_date            = EXCLUDED.peak_ndvi_date,
-    senescence_date           = EXCLUDED.senescence_date,
-    season_length_days        = EXCLUDED.season_length_days,
-    ndvi_integral             = EXCLUDED.ndvi_integral,
-    ndvi_rise_rate            = EXCLUDED.ndvi_rise_rate,
-    total_rainfall_mm         = EXCLUDED.total_rainfall_mm,
-    planting_processed_at     = EXCLUDED.planting_processed_at,
-    updated_at                = NOW()
+SELECT
+    i.farm_uuid,
+    i.planting_date,
+    i.planting_season,
+    i.planting_year,
+    i.planting_confidence,
+    i.planting_confidence_level,
+    i.planting_method,
+    i.peak_ndvi,
+    i.peak_ndvi_date,
+    i.senescence_date,
+    i.season_length_days,
+    i.ndvi_integral,
+    i.ndvi_rise_rate,
+    i.total_rainfall_mm,
+    i.planting_processed_at,
+    i.updated_at
+FROM incoming i
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM spatial.farm_intelligence fi
+    WHERE fi.farm_uuid = i.farm_uuid
+)
 """
 
 
