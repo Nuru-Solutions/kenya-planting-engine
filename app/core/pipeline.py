@@ -56,12 +56,13 @@ def parse_geojson(geojson: dict) -> list[FarmPolygon]:
             cx = cy = 0.0
 
         pid = str(props.get("ID") or props.get("fid") or uuid4())
+        aez_code = props.get("Aez_Code")
         polygons.append(FarmPolygon(
             polygon_id=pid,
             fid=props.get("fid"),
             county=props.get("County"),
             ward=props.get("Ward"),
-            aez_code=props.get("Aez_Code"),
+            aez_code=str(aez_code) if aez_code is not None else None,
             geometry=geometry,
             centroid_lat=cy,
             centroid_lon=cx,
