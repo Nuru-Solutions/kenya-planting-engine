@@ -40,10 +40,12 @@ import os
 from datetime import date
 from typing import Dict, List, Optional, Tuple
 
+import boto3
 import numpy as np
 import psycopg2
 import psycopg2.extras
 import rasterio
+from botocore.exceptions import ClientError
 from rasterio.enums import Resampling
 from rasterio.windows import from_bounds
 from pystac_client import Client
@@ -453,6 +455,38 @@ class Sentinel1STACFetcher:
         self.conn     = conn
         self.settings = get_settings()
         self._client  = Client.open(self.settings.stac_api_url)
+        self._s3      = boto3.client("s3")
+        self._s3_exists_cache: Dict[str, bool] = {}
+
+    def _resolve_existing_asset_href(self, asset_href: str) -> Optional[str]:
+        """
+        Return the first resolvable href candidate for an S1 asset, else None.
+
+        Uses HEAD Object with requester pays for s3:// URIs and caches results
+        to avoid repeated checks across farms.
+        """
+        for href in _s1_asset_href_candidates(asset_href):
+            cached = self._s3_exists_cache.get(href)
+            if cached is not None:
+                if cached:
+                    return href
+                continue
+
+            exists = True
+            if href.startswith("s3://"):
+                try:
+                    bucket_key = href[5:]
+                    bucket, key = bucket_key.split("/", 1)
+                    self._s3.head_object(Bucket=bucket, Key=key, RequestPayer="requester")
+                    exists = True
+                except (ValueError, ClientError, Exception):
+                    exists = False
+
+            self._s3_exists_cache[href] = exists
+            if exists:
+                return href
+
+        return None
 
     def fetch_for_tile(
         self,
@@ -500,13 +534,47 @@ class Sentinel1STACFetcher:
             logger.info("S1: No STAC items for tile %s — SAR signal will be absent (graceful)", tile_id)
             return results
 
+        # Pre-filter scenes with unreadable/missing VV assets to avoid repeated
+        # rasterio open failures for every farm in the tile.
+        usable_items = []
+        skipped_items = 0
+        for item in items:
+            vv_asset = item.assets.get("vv") or item.assets.get("VV")
+            vh_asset = item.assets.get("vh") or item.assets.get("VH")
+            if not vv_asset:
+                skipped_items += 1
+                continue
+
+            resolved_vv = self._resolve_existing_asset_href(vv_asset.href)
+            if not resolved_vv:
+                skipped_items += 1
+                logger.warning("S1 item %s skipped: VV asset unavailable", item.id)
+                continue
+
+            vv_asset.href = resolved_vv
+            if vh_asset:
+                resolved_vh = self._resolve_existing_asset_href(vh_asset.href)
+                if resolved_vh:
+                    vh_asset.href = resolved_vh
+
+            usable_items.append(item)
+
+        if skipped_items:
+            logger.warning(
+                "S1 tile=%s skipped %d/%d scenes due to unavailable assets",
+                tile_id, skipped_items, len(items)
+            )
+        if not usable_items:
+            logger.warning("S1: No usable scenes for tile %s after asset checks", tile_id)
+            return results
+
         with rasterio.Env(**RASTERIO_ENV):
             for farm_uuid, geom_wkt in tile_farms:
                 try:
                     geom = shapely_wkt.loads(geom_wkt)
                     minx, miny, maxx, maxy = geom.bounds
 
-                    for item in items:
+                    for item in usable_items:
                         obs = self._process_s1_item(item, farm_uuid, minx, miny, maxx, maxy)
                         if obs is not None:
                             results[farm_uuid].append(obs)
