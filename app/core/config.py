@@ -276,6 +276,11 @@ CROP_REGISTRY: dict[str, CropConfig] = {
 _CROP_ALIASES: dict[str, str] = {
     "common_bean": "beans",
     "common bean": "beans",
+    "common-bean": "beans",
+    "commonbeans": "beans",
+    "dry_bean": "beans",
+    "dry bean": "beans",
+    "dry-bean": "beans",
     "bean": "beans",
 }
 

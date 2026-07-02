@@ -213,6 +213,13 @@ def _s1_asset_href_candidates(asset_href: str) -> List[str]:
     return candidates
 
 
+def _format_reason_counts(reason_counts: Dict[str, int]) -> str:
+    """Build a compact, stable reason summary for aggregated skip logs."""
+    if not reason_counts:
+        return "unknown"
+    return ", ".join(f"{k}={v}" for k, v in sorted(reason_counts.items(), key=lambda x: -x[1]))
+
+
 # ── Sentinel-2 Fetcher ──────────────────────────────────────────────────────────
 
 class Sentinel2STACFetcher:
@@ -457,9 +464,12 @@ class Sentinel1STACFetcher:
         self._client  = Client.open(self.settings.stac_api_url)
         self._s3      = boto3.client("s3")
         self._s3_exists_cache: Dict[str, bool] = {}
-        self._s3_error_reasons: Dict[str, int] = {}
 
-    def _resolve_existing_asset_href(self, asset_href: str) -> Optional[str]:
+    def _resolve_existing_asset_href(
+        self,
+        asset_href: str,
+        reason_counts: Optional[Dict[str, int]] = None,
+    ) -> Optional[str]:
         """
         Return the first resolvable href candidate for an S1 asset, else None.
 
@@ -482,14 +492,17 @@ class Sentinel1STACFetcher:
                     exists = True
                 except ValueError:
                     exists = False
-                    self._s3_error_reasons["InvalidS3Uri"] = self._s3_error_reasons.get("InvalidS3Uri", 0) + 1
+                    if reason_counts is not None:
+                        reason_counts["InvalidS3Uri"] = reason_counts.get("InvalidS3Uri", 0) + 1
                 except ClientError as exc:
                     exists = False
                     code = exc.response.get("Error", {}).get("Code", "ClientError")
-                    self._s3_error_reasons[code] = self._s3_error_reasons.get(code, 0) + 1
+                    if reason_counts is not None:
+                        reason_counts[code] = reason_counts.get(code, 0) + 1
                 except Exception:
                     exists = False
-                    self._s3_error_reasons["UnknownError"] = self._s3_error_reasons.get("UnknownError", 0) + 1
+                    if reason_counts is not None:
+                        reason_counts["UnknownError"] = reason_counts.get("UnknownError", 0) + 1
 
             self._s3_exists_cache[href] = exists
             if exists:
@@ -547,6 +560,7 @@ class Sentinel1STACFetcher:
         # rasterio open failures for every farm in the tile.
         usable_items = []
         skipped_items = 0
+        skip_reasons: Dict[str, int] = {}
         for item in items:
             vv_asset = item.assets.get("vv") or item.assets.get("VV")
             vh_asset = item.assets.get("vh") or item.assets.get("VH")
@@ -554,28 +568,37 @@ class Sentinel1STACFetcher:
                 skipped_items += 1
                 continue
 
-            resolved_vv = self._resolve_existing_asset_href(vv_asset.href)
+            resolved_vv = self._resolve_existing_asset_href(vv_asset.href, skip_reasons)
             if not resolved_vv:
                 skipped_items += 1
-                logger.debug("S1 item %s skipped: VV asset unavailable", item.id)
                 continue
 
             vv_asset.href = resolved_vv
             if vh_asset:
-                resolved_vh = self._resolve_existing_asset_href(vh_asset.href)
+                resolved_vh = self._resolve_existing_asset_href(vh_asset.href, skip_reasons)
                 if resolved_vh:
                     vh_asset.href = resolved_vh
 
             usable_items.append(item)
 
         if skipped_items:
-            reason_str = ", ".join(
-                f"{k}={v}" for k, v in sorted(self._s3_error_reasons.items(), key=lambda x: -x[1])
-            ) or "unknown"
+            reason_str = _format_reason_counts(skip_reasons)
             logger.warning(
                 "S1 tile=%s skipped %d/%d scenes due to unavailable assets (reasons: %s)",
                 tile_id, skipped_items, len(items), reason_str
             )
+            access_denied = (
+                skip_reasons.get("403", 0)
+                + skip_reasons.get("AccessDenied", 0)
+                + skip_reasons.get("Forbidden", 0)
+            )
+            if access_denied:
+                logger.warning(
+                    "S1 tile=%s includes %d access-denied asset checks; verify Batch job role has requester-pays "
+                    "S3 permissions on bucket sentinel-s1-l1c",
+                    tile_id,
+                    access_denied,
+                )
         if not usable_items:
             logger.warning("S1: No usable scenes for tile %s after asset checks", tile_id)
             return results
@@ -648,28 +671,30 @@ class Sentinel1STACFetcher:
 
         def _read_band_mean(asset_href: str) -> Optional[float]:
             """Read band, convert DN amplitude → sigma0 dB."""
-            for href in _s1_asset_href_candidates(asset_href):
-                try:
-                    with rasterio.open(href) as src:
-                        window = from_bounds(minx, miny, maxx, maxy, transform=src.transform)
-                        raw = src.read(
-                            1, window=window,
-                            out_shape=(32, 32),
-                            resampling=Resampling.bilinear,
-                            boundless=True,
-                        )
-                    arr = raw.astype(np.float32)
-                    # Remove nodata (zero or negative values)
-                    valid = arr[arr > 0]
-                    if valid.size == 0:
-                        return None
-                    # DN amplitude → linear power → dB
-                    amplitude_f  = valid / 10000.0
-                    power_linear = amplitude_f ** 2
-                    sigma0_db    = 10.0 * np.log10(power_linear + 1e-10)
-                    return float(np.mean(sigma0_db))
-                except Exception as exc:
-                    logger.debug("S1 band read error item %s href=%s: %s", item.id, href, exc)
+            resolved_href = self._resolve_existing_asset_href(asset_href)
+            if not resolved_href:
+                return None
+            try:
+                with rasterio.open(resolved_href) as src:
+                    window = from_bounds(minx, miny, maxx, maxy, transform=src.transform)
+                    raw = src.read(
+                        1, window=window,
+                        out_shape=(32, 32),
+                        resampling=Resampling.bilinear,
+                        boundless=True,
+                    )
+                arr = raw.astype(np.float32)
+                # Remove nodata (zero or negative values)
+                valid = arr[arr > 0]
+                if valid.size == 0:
+                    return None
+                # DN amplitude → linear power → dB
+                amplitude_f  = valid / 10000.0
+                power_linear = amplitude_f ** 2
+                sigma0_db    = 10.0 * np.log10(power_linear + 1e-10)
+                return float(np.mean(sigma0_db))
+            except Exception as exc:
+                logger.debug("S1 band read error item %s href=%s: %s", item.id, resolved_href, exc)
             return None
 
         vv_db = _read_band_mean(vv_asset.href)
