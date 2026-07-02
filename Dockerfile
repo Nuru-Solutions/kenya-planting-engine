@@ -22,6 +22,7 @@ COPY . .
 # (set AWS_BATCH_JOB_ID automatically by Batch; POSTGIS_HOST_PRIVATE must be
 #  configured in the Batch Job Definition environment section)
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
 
 # Default entrypoint — AWS Batch overrides CMD via Job Definition
 CMD ["python", "scripts/run_datacube_batch.py"]
