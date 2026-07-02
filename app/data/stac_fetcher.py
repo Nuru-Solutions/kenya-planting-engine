@@ -173,6 +173,44 @@ def _read_scl_mask(item, minx: float, miny: float, maxx: float, maxy: float,
         return None
 
 
+def _normalize_s1_l1c_href_date(href: str) -> str:
+    """
+    Normalize Sentinel-1 L1C S3 key date segments to zero-padded MM/DD.
+
+    Some STAC items expose hrefs like .../GRD/2026/1/4/... while object keys are
+    stored as .../GRD/2026/01/04/... . This normalizes the known variant.
+    """
+    prefix = "s3://sentinel-s1-l1c/GRD/"
+    if not href.startswith(prefix):
+        return href
+
+    parts = href.split("/")
+    try:
+        grd_idx = parts.index("GRD")
+    except ValueError:
+        return href
+
+    if len(parts) <= grd_idx + 3:
+        return href
+
+    month = parts[grd_idx + 2]
+    day = parts[grd_idx + 3]
+    if month.isdigit() and day.isdigit():
+        parts[grd_idx + 2] = month.zfill(2)
+        parts[grd_idx + 3] = day.zfill(2)
+        return "/".join(parts)
+    return href
+
+
+def _s1_asset_href_candidates(asset_href: str) -> List[str]:
+    """Return candidate hrefs to try for Sentinel-1 assets."""
+    candidates = [asset_href]
+    normalized = _normalize_s1_l1c_href_date(asset_href)
+    if normalized != asset_href:
+        candidates.append(normalized)
+    return candidates
+
+
 # ── Sentinel-2 Fetcher ──────────────────────────────────────────────────────────
 
 class Sentinel2STACFetcher:
@@ -530,28 +568,29 @@ class Sentinel1STACFetcher:
 
         def _read_band_mean(asset_href: str) -> Optional[float]:
             """Read band, convert DN amplitude → sigma0 dB."""
-            try:
-                with rasterio.open(asset_href) as src:
-                    window = from_bounds(minx, miny, maxx, maxy, transform=src.transform)
-                    raw = src.read(
-                        1, window=window,
-                        out_shape=(32, 32),
-                        resampling=Resampling.bilinear,
-                        boundless=True,
-                    )
-                arr = raw.astype(np.float32)
-                # Remove nodata (zero or negative values)
-                valid = arr[arr > 0]
-                if valid.size == 0:
-                    return None
-                # DN amplitude → linear power → dB
-                amplitude_f  = valid / 10000.0
-                power_linear = amplitude_f ** 2
-                sigma0_db    = 10.0 * np.log10(power_linear + 1e-10)
-                return float(np.mean(sigma0_db))
-            except Exception as exc:
-                logger.debug("S1 band read error item %s: %s", item.id, exc)
-                return None
+            for href in _s1_asset_href_candidates(asset_href):
+                try:
+                    with rasterio.open(href) as src:
+                        window = from_bounds(minx, miny, maxx, maxy, transform=src.transform)
+                        raw = src.read(
+                            1, window=window,
+                            out_shape=(32, 32),
+                            resampling=Resampling.bilinear,
+                            boundless=True,
+                        )
+                    arr = raw.astype(np.float32)
+                    # Remove nodata (zero or negative values)
+                    valid = arr[arr > 0]
+                    if valid.size == 0:
+                        return None
+                    # DN amplitude → linear power → dB
+                    amplitude_f  = valid / 10000.0
+                    power_linear = amplitude_f ** 2
+                    sigma0_db    = 10.0 * np.log10(power_linear + 1e-10)
+                    return float(np.mean(sigma0_db))
+                except Exception as exc:
+                    logger.debug("S1 band read error item %s href=%s: %s", item.id, href, exc)
+            return None
 
         vv_db = _read_band_mean(vv_asset.href)
         if vv_db is None:
