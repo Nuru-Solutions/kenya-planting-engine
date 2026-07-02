@@ -349,6 +349,7 @@ class DatacubeClient:
         for farm_uuid, sr in results:
             n = sr.ndvi_signal
             r = sr.rainfall_signal
+            now_utc = dt.utcnow()
             rows.append((
                 farm_uuid,
                 sr.estimated_planting_date,       # planting_date
@@ -364,7 +365,8 @@ class DatacubeClient:
                 n.ndvi_integral,                   # ndvi_integral
                 n.ndvi_rise_rate,                  # ndvi_rise_rate
                 r.total_seasonal_rainfall_mm,      # total_rainfall_mm
-                dt.utcnow(),                       # planting_processed_at
+                now_utc,                           # planting_processed_at
+                now_utc,                           # updated_at
             ))
 
         if dry_run:
@@ -381,7 +383,7 @@ class DatacubeClient:
                     template=(
                         "(%s::uuid, %s::date, %s, %s::smallint, %s::float, %s, %s, "
                         "%s::float, %s::date, %s::date, %s::smallint, %s::float, %s::float, "
-                        "%s::float, %s::timestamptz)"
+                        "%s::float, %s::timestamptz, %s::timestamptz)"
                     ),
                     page_size=500,
                 )

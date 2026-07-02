@@ -273,6 +273,17 @@ CROP_REGISTRY: dict[str, CropConfig] = {
     # ),
 }
 
+_CROP_ALIASES: dict[str, str] = {
+    "common_bean": "beans",
+    "common bean": "beans",
+    "bean": "beans",
+}
+
+_FALLBACK_CROP_BY_ALIAS: dict[str, CropConfig] = {
+    # Until beans is fully enabled in CROP_REGISTRY, use maize defaults without warning spam.
+    "beans": CROP_REGISTRY["maize"],
+}
+
 
 def get_crop_config(crop_type: str) -> CropConfig:
     """
@@ -280,6 +291,9 @@ def get_crop_config(crop_type: str) -> CropConfig:
     To add a new crop: uncomment its entry in CROP_REGISTRY above — zero code changes.
     """
     ct = (crop_type or "maize").strip().lower()
+    ct = _CROP_ALIASES.get(ct, ct)
+    if ct in _FALLBACK_CROP_BY_ALIAS:
+        return _FALLBACK_CROP_BY_ALIAS[ct]
     if ct not in CROP_REGISTRY:
         logger.warning("Unknown crop_type '%s' — falling back to maize CropConfig", ct)
     return CROP_REGISTRY.get(ct, CROP_REGISTRY["maize"])
