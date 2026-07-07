@@ -50,8 +50,11 @@ class RainfallOnsetDetector:
         records: list[RainfallRecord],
         season_window: SeasonWindow,
         year: int,
+        farm_id: str = "",
     ) -> RainfallOnsetSignal:
+        _f = f"[{farm_id}] " if farm_id else ""
         if not records:
+            logger.debug("%sRAINFALL gate=no_records: 0 rainfall records available", _f)
             return RainfallOnsetSignal(available=False)
 
         thr        = self.settings.rainfall_onset_threshold_mm
@@ -63,6 +66,11 @@ class RainfallOnsetDetector:
         dates = sorted(d for d in rmap if search_start <= d <= win_end)
 
         if len(dates) < 3:
+            logger.debug(
+                "%sRAINFALL gate=insufficient_dates: %d in-window dates [%s → %s], "
+                "%d total records",
+                _f, len(dates), search_start, win_end, len(records),
+            )
             return RainfallOnsetSignal(available=False)
 
         seasonal_total = round(sum(rmap.get(d, 0.0) for d in dates), 1)
@@ -83,6 +91,11 @@ class RainfallOnsetDetector:
                 })
 
         if not candidates:
+            logger.debug(
+                "%sRAINFALL gate=no_candidates: no 3-day event >= %.1f mm found in "
+                "%d in-window dates (seasonal_total=%.1f mm)",
+                _f, thr, len(dates), seasonal_total,
+            )
             return RainfallOnsetSignal(
                 available=True, confidence=0.1, is_false_start=True,
                 total_seasonal_rainfall_mm=seasonal_total,
@@ -91,6 +104,13 @@ class RainfallOnsetDetector:
         real = [c for c in candidates if not c["is_false_start"]]
         best = (real or candidates)[0]
 
+        logger.debug(
+            "%sRAINFALL detected: onset=%s cumulative=%.1f mm conf=%.3f "
+            "false_start=%s (%d candidates, %d non-false-start)",
+            _f, best["onset_date"], best["cumulative_3day_mm"],
+            best["confidence"], best["is_false_start"],
+            len(candidates), len(real),
+        )
         return RainfallOnsetSignal(
             onset_date=best["onset_date"],
             cumulative_3day_mm=best["cumulative_3day_mm"],
@@ -152,6 +172,7 @@ class NDVIGreenupDetector:
         season_window: SeasonWindow,
         year: int,
         crop_config: Optional[CropConfig] = None,
+        farm_id: str = "",
     ) -> NDVIGreenupSignal:
         """Detect NDVI greenup and estimate planting date.
 
@@ -162,8 +183,11 @@ class NDVIGreenupDetector:
         year : crop calendar year
         crop_config : CropConfig for this farm (sets planting_offset_days).
                       If None, falls back to DEFAULT_PLANTING_OFFSET (12 days, maize).
+        farm_id : optional farm identifier for diagnostic gate logging.
         """
+        _f = f"[{farm_id}] " if farm_id else ""
         if not observations:
+            logger.debug("%sNDVI gate=no_observations: 0 NDVI observations in cache", _f)
             return NDVIGreenupSignal(available=False)
 
         win_start, win_end = season_window.get_window(year)
@@ -173,6 +197,17 @@ class NDVIGreenupDetector:
                  if o.cloud_cover_pct <= self.MAX_CLOUD and o.pixel_count >= self.MIN_PIXELS]
 
         if len(valid) < 3:
+            n_cloudy = sum(1 for o in observations if o.cloud_cover_pct > self.MAX_CLOUD)
+            n_sparse = sum(
+                1 for o in observations
+                if o.cloud_cover_pct <= self.MAX_CLOUD and o.pixel_count < self.MIN_PIXELS
+            )
+            logger.debug(
+                "%sNDVI gate=insufficient_valid: %d total obs → %d valid "
+                "(rejected: %d cloud>%d%%, %d pixels<%d)",
+                _f, len(observations), len(valid),
+                n_cloudy, self.MAX_CLOUD, n_sparse, self.MIN_PIXELS,
+            )
             return NDVIGreenupSignal(
                 available=True, confidence=0.1,
                 cloud_gap_days=self._max_gap(observations, search_start, win_end),
@@ -189,6 +224,11 @@ class NDVIGreenupDetector:
                         key=lambda x: x.obs_date)
 
         if len(in_win) < 2:
+            logger.debug(
+                "%sNDVI gate=insufficient_inwindow: %d valid obs inside window "
+                "[%s → %s] (baseline=%.4f from %d pre-season obs)",
+                _f, len(in_win), search_start, win_end, baseline, len(pre_obs),
+            )
             return NDVIGreenupSignal(
                 available=True, baseline_ndvi=round(baseline, 4),
                 confidence=0.15, n_observations=len(in_win),
@@ -209,6 +249,12 @@ class NDVIGreenupDetector:
                     break
 
         if greenup_date is None:
+            logger.debug(
+                "%sNDVI gate=no_greenup: need rise > %.4f (baseline=%.4f + thr=%.4f); "
+                "%d in-window obs, smoothed NDVI range [%.4f → %.4f]",
+                _f, baseline + thr, baseline, thr,
+                len(in_win), min(smooth), max(smooth),
+            )
             return NDVIGreenupSignal(
                 available=True, baseline_ndvi=round(baseline, 4),
                 confidence=0.1,
@@ -261,6 +307,12 @@ class NDVIGreenupDetector:
         gap  = self._max_gap(observations, search_start, win_end)
         conf = self._score(peak_ndvi - baseline, len(in_win), gap, estimated_planting, win_start, win_end)
 
+        logger.debug(
+            "%sNDVI detected: greenup=%s planting=%s peak_ndvi=%.4f "
+            "(baseline=%.4f rise=%.4f) conf=%.3f n_obs=%d gap=%dd",
+            _f, greenup_date, estimated_planting, peak_ndvi,
+            baseline, peak_ndvi - baseline, conf, len(in_win), gap,
+        )
         return NDVIGreenupSignal(
             greenup_date=greenup_date,
             estimated_planting_date=estimated_planting,
@@ -338,8 +390,11 @@ class SARTillageDetector:
         season_window: SeasonWindow,
         year: int,
         peak_ndvi_date: Optional[date] = None,   # passed in from NDVI signal
+        farm_id: str = "",
     ) -> SARTillageSignal:
+        _f = f"[{farm_id}] " if farm_id else ""
         if not observations:
+            logger.debug("%sSAR gate=no_observations: 0 SAR observations in cache", _f)
             return SARTillageSignal(available=False)
 
         win_start, win_end = season_window.get_window(year)
@@ -351,6 +406,11 @@ class SARTillageDetector:
         in_win       = [o for o in sar if search_start <= o.obs_date <= win_end]
 
         if len(in_win) < 2:
+            logger.debug(
+                "%sSAR gate=insufficient_inwindow: %d in-window obs (need>=2), "
+                "%d baseline obs, window=[%s → %s]",
+                _f, len(in_win), len(baseline_obs), search_start, win_end,
+            )
             return SARTillageSignal(available=True, confidence=0.1)
 
         baseline_vv = (statistics.mean([o.vv_db for o in baseline_obs]) if baseline_obs
@@ -396,6 +456,11 @@ class SARTillageDetector:
             )
 
         if tillage_date is None:
+            logger.debug(
+                "%sSAR gate=no_signal: no tillage drop >= %.1f dB or moisture increase; "
+                "vv_baseline=%.3f dB, %d in-window obs",
+                _f, abs(thr), baseline_vv, len(in_win),
+            )
             return SARTillageSignal(
                 available=True, confidence=0.15,
                 vv_baseline=round(baseline_vv, 3), vv_timeseries=vv_ts,
@@ -403,6 +468,10 @@ class SARTillageDetector:
 
         conf = self._score(vv_change or 0.0, moisture, len(in_win), tillage_date, win_start, win_end)
 
+        logger.debug(
+            "%sSAR detected: tillage=%s vv_change=%.3f dB moisture=%s conf=%.3f",
+            _f, tillage_date, vv_change or 0.0, moisture, conf,
+        )
         return SARTillageSignal(
             onset_date=tillage_date, vv_change_db=vv_change,
             vv_baseline=round(baseline_vv, 3),
@@ -446,12 +515,15 @@ class PlantingDateEnsemble:
         year: int,
         fallback: bool = True,
         aez_weights: tuple[float, float, float] | None = None,
+        farm_id: str = "",
     ) -> tuple[Optional[date], float, str]:
         """Returns (estimated_date, confidence_score, method_label).
 
         aez_weights: optional (rainfall, ndvi, sar) override from AEZConfig.
         Falls back to global Settings weights if None.
+        farm_id: optional identifier for diagnostic log lines.
         """
+        _f = f"[{farm_id}] " if farm_id else ""
         s = self.settings
         w_rain = aez_weights[0] if aez_weights else s.weight_rainfall
         w_ndvi = aez_weights[1] if aez_weights else s.weight_ndvi
@@ -463,16 +535,31 @@ class PlantingDateEnsemble:
             signal_dates.append(rainfall.onset_date)
             weights.append(w_rain)
             confs.append(rainfall.confidence)
+            logger.debug("%sENSEMBLE rain=INCLUDED  date=%s conf=%.3f w=%.2f",
+                         _f, rainfall.onset_date, rainfall.confidence, w_rain)
+        else:
+            logger.debug("%sENSEMBLE rain=EXCLUDED  available=%s onset_date=%s",
+                         _f, rainfall.available, rainfall.onset_date)
 
         if ndvi.available and ndvi.estimated_planting_date:
             signal_dates.append(ndvi.estimated_planting_date)
             weights.append(w_ndvi)
             confs.append(ndvi.confidence)
+            logger.debug("%sENSEMBLE ndvi=INCLUDED  date=%s conf=%.3f w=%.2f",
+                         _f, ndvi.estimated_planting_date, ndvi.confidence, w_ndvi)
+        else:
+            logger.debug("%sENSEMBLE ndvi=EXCLUDED  available=%s planting_date=%s",
+                         _f, ndvi.available, ndvi.estimated_planting_date)
 
         if sar.available and sar.onset_date:
             signal_dates.append(sar.onset_date)
             weights.append(w_sar)
             confs.append(sar.confidence)
+            logger.debug("%sENSEMBLE sar=INCLUDED   date=%s conf=%.3f w=%.2f",
+                         _f, sar.onset_date, sar.confidence, w_sar)
+        else:
+            logger.debug("%sENSEMBLE sar=EXCLUDED   available=%s onset_date=%s",
+                         _f, sar.available, sar.onset_date)
 
         if not signal_dates:
             if fallback:
@@ -511,6 +598,10 @@ class PlantingDateEnsemble:
             method      = f"{method}_clim_blend"
             final_conf  = max(final_conf, 0.25)
 
+        logger.debug(
+            "%sENSEMBLE result: n_signals=%d date=%s conf=%.3f method=%s",
+            _f, n, ens_date, round(final_conf, 3), method,
+        )
         return ens_date, round(final_conf, 3), method
 
     def _agreement(self, dates: list[date]) -> float:

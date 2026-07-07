@@ -227,17 +227,32 @@ class PolygonProcessor:
                     logger.warning("CHIRPS GEE fetch failed %s: %s", polygon.polygon_id, e)
 
         # ── Detect ─────────────────────────────────────────────────────────────
+        _pid = polygon.polygon_id[:8]
+        logger.debug(
+            "[%s] fetch complete: ndvi_obs=%d sar_obs=%d rainfall_records=%d crop=%s",
+            _pid, len(ndvi_obs), len(sar_obs), len(rainfall),
+            polygon.crop_type or "maize",
+        )
+        if self.use_ndvi and not ndvi_obs:
+            logger.debug("[%s] NDVI gate=skipped: ndvi_obs list empty after STAC fetch", _pid)
+        if self.use_sar and not sar_obs:
+            logger.debug("[%s] SAR  gate=skipped: sar_obs list empty after STAC fetch", _pid)
+        if self.use_rainfall and not rainfall:
+            logger.debug("[%s] RAIN gate=skipped: no rainfall records fetched", _pid)
+
         rain_sig = (
-            self.rain_det.detect(rainfall, season_window, year)
+            self.rain_det.detect(rainfall, season_window, year, farm_id=_pid)
             if self.use_rainfall and rainfall else RainfallOnsetSignal(available=False)
         )
         ndvi_sig = (
-            self.ndvi_det.detect(ndvi_obs, season_window, year, crop_config=crop_config)
+            self.ndvi_det.detect(ndvi_obs, season_window, year, crop_config=crop_config,
+                                 farm_id=_pid)
             if self.use_ndvi and ndvi_obs else NDVIGreenupSignal(available=False)
         )
         # Pass NDVI peak date to SAR detector so it can extract SAR phenology at crop peak
         sar_sig = (
-            self.sar_det.detect(sar_obs, season_window, year, peak_ndvi_date=ndvi_sig.peak_date)
+            self.sar_det.detect(sar_obs, season_window, year, peak_ndvi_date=ndvi_sig.peak_date,
+                                farm_id=_pid)
             if self.use_sar and sar_obs else SARTillageSignal(available=False)
         )
 
@@ -245,6 +260,7 @@ class PolygonProcessor:
         est_date, confidence, method = self.ensemble.combine(
             rain_sig, ndvi_sig, sar_sig, season_window, year, self.fallback,
             aez_weights=aez.signal_weights,
+            farm_id=_pid,
         )
         conf_level = self.ensemble.confidence_level(confidence)
 
