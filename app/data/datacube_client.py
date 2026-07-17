@@ -66,6 +66,7 @@ WHERE  fi.crop_type IS NOT NULL
   AND  fi.tile_id IS NOT NULL
   AND  (
       fi.planting_date IS NULL
+      OR fi.planting_processed_at IS NULL
       OR fi.planting_processed_at < NOW() - INTERVAL '30 days'
   )
 ORDER  BY fi.tile_id, fi.farm_uuid
