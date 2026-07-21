@@ -120,6 +120,10 @@ updated AS (
         planting_date             = i.planting_date,
         planting_season           = i.planting_season,
         planting_year             = i.planting_year,
+        -- Keep crop_season consistent with the freshly detected planting.
+        -- Stage 3 writes this field independently; without this sync a 2026
+        -- planting can sit next to a stale '2025_long_rains' crop_season.
+        crop_season               = i.planting_year::text || '_' || i.planting_season,
         planting_confidence       = i.planting_confidence,
         planting_confidence_level = i.planting_confidence_level,
         planting_method           = i.planting_method,
@@ -134,6 +138,8 @@ updated AS (
         updated_at                = i.updated_at
     FROM incoming i
     WHERE fi.farm_uuid = i.farm_uuid
+      -- Never let a failed/empty detection wipe an existing planting date
+      AND i.planting_date IS NOT NULL
     RETURNING fi.farm_uuid
 )
 INSERT INTO spatial.farm_intelligence (
@@ -141,6 +147,7 @@ INSERT INTO spatial.farm_intelligence (
     planting_date,
     planting_season,
     planting_year,
+    crop_season,
     planting_confidence,
     planting_confidence_level,
     planting_method,
@@ -159,6 +166,7 @@ SELECT
     i.planting_date,
     i.planting_season,
     i.planting_year,
+    i.planting_year::text || '_' || i.planting_season,
     i.planting_confidence,
     i.planting_confidence_level,
     i.planting_method,

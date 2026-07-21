@@ -40,15 +40,9 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
-
-# Ensure project root is importable when script is invoked directly in Batch.
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.core.config import get_aez_config, Season, get_settings
 from app.core.models import FarmRow, SeasonResult
@@ -204,9 +198,19 @@ def run_batch_pipeline(
                         logger.error("Farm %s raised: %s", farm_uuid[:8], exc)
 
             # ── 4c. Bulk upsert results for this tile ───────────────────────────
-            if tile_results:
-                dc.upsert_planting_results(tile_results, dry_run=dry_run)
-                all_upsert_rows.extend(tile_results)
+            # Only persist successful detections: failed results carry
+            # estimated_planting_date=None and would stamp planting_processed_at
+            # (30-day retry cooldown) or overwrite good data with NULLs.
+            ok_results = [
+                (fuid, r) for fuid, r in tile_results
+                if not r.error and r.estimated_planting_date is not None
+            ]
+            skipped = len(tile_results) - len(ok_results)
+            if skipped:
+                logger.info("Skipping %d failed/empty detections (not written)", skipped)
+            if ok_results:
+                dc.upsert_planting_results(ok_results, dry_run=dry_run)
+                all_upsert_rows.extend(ok_results)
 
         # ── 5. Summary ──────────────────────────────────────────────────────────
         total = total_succeeded + total_failed
