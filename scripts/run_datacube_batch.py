@@ -232,6 +232,55 @@ def run_batch_pipeline(
             logger.info("   ⚠️  DRY RUN — no rows written to farm_intelligence")
         logger.info("=" * 65)
 
+        # ── Downstream chaining ───────────────────────────────────────────
+        import os as _os, json as _json, urllib.request as _urllib_req
+
+        upload_id        = _os.environ.get("UPLOAD_ID")
+        webhook_template = _os.environ.get(
+            "GPS_RESULT_WEBHOOK_URL_TEMPLATE",
+            "https://api.nuru.solutions/organization/upload-status/{upload_id}/pipeline/",
+        )
+        webhook_secret   = _os.environ.get("GPS_RESULT_WEBHOOK_SECRET", "nuru-gps-webhook-secret-key-12345")
+
+        # 1. Report planting_date = "completed" to Django (CSV upload runs only)
+        if upload_id and not dry_run:
+            try:
+                url     = webhook_template.format(upload_id=upload_id)
+                payload = _json.dumps({"pipeline_status": {"planting_date": "completed"}}).encode()
+                req = _urllib_req.Request(
+                    url, data=payload,
+                    headers={"Content-Type": "application/json",
+                             "X-Pipeline-Key": webhook_secret},
+                    method="PATCH",
+                )
+                with _urllib_req.urlopen(req, timeout=10) as resp:
+                    logger.info("📡 Planting date completion reported to Django (HTTP %s)", resp.status)
+            except Exception as wh_err:
+                logger.error("Failed to report planting_date completion to Django: %s", wh_err)
+        else:
+            logger.info("No UPLOAD_ID set or dry-run — skipping planting_date webhook")
+
+        # 2. Trigger Stage 5: Crop Health pipeline.
+        #    Always triggered (scheduled cron runs also need to chain here).
+        #    UPLOAD_ID is forwarded so crop health can report its own completion
+        #    to Django for the correct upload.
+        if not dry_run:
+            import boto3 as _boto3
+            crop_health_lambda = _os.environ.get("CROP_HEALTH_LAMBDA_NAME", "nuru-start-crop-health-pipeline")
+            try:
+                lc = _boto3.client("lambda", region_name=_os.environ.get("AWS_REGION", "eu-north-1"))
+                lc.invoke(
+                    FunctionName=crop_health_lambda,
+                    InvocationType="Event",
+                    Payload=_json.dumps({
+                        "source": "planting-engine",
+                        "upload_id": upload_id,
+                    }),
+                )
+                logger.info("🚀 Triggered %s to start Crop Health pipeline (Stage 5)", crop_health_lambda)
+            except Exception as ch_err:
+                logger.error("Failed to trigger Crop Health pipeline: %s", ch_err)
+
         return 0 if total_failed == 0 else 1
 
     finally:
