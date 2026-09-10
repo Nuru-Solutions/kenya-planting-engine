@@ -3,13 +3,17 @@
 # Job 1  test           Runs on every push and every PR to any branch.
 #                       Installs deps, runs pytest.
 #
-# Job 2  build-deploy   Runs on push to `master` ONLY (after `test` passes).
-#                       Builds the Docker image, pushes to ECR with two tags:
-#                         • latest
-#                         • git-<short-sha>  (immutable, used in Job Definition)
-#                       Registers a new AWS Batch Job Definition revision pointing
-#                       at the git-sha tag so Batch always runs the exact commit
-#                       that passed CI.
+# Job 2  build-deploy   Runs on push to `master` (Prod) or `staging` (Staging)
+#                       only, after `test` passes. Builds the Docker image,
+#                       pushes to ECR tagged with the immutable git-<short-sha>
+#                       (used in the Job Definition for both environments) --
+#                       plus `latest` for Prod pushes only. Registers a new AWS
+#                       Batch Job Definition revision under
+#                       "nuru-stage4-planting-engine" (Prod, unchanged) or
+#                       "stage4-planting-engine-job-staging" (Staging, new --
+#                       see terraform/environments/staging/main.tf), pointed at
+#                       the sha tag so Batch always runs the exact commit that
+#                       passed CI.
 #
 # Required GitHub repo secrets (Settings → Secrets → Actions):
 #   AWS_ACCESS_KEY_ID       IAM key with ECR push + Batch RegisterJobDefinition
@@ -30,9 +34,11 @@ env:
   AWS_REGION:      eu-north-1
   ECR_REGISTRY:    741448918017.dkr.ecr.eu-north-1.amazonaws.com
   ECR_REPOSITORY:  kenya-planting-engine
-  # Batch resources (must match terraform/main.tf)
-  BATCH_JOB_DEF:   nuru-stage4-planting-engine
   BATCH_JOB_QUEUE: cpu_job_queue
+  # BATCH_JOB_DEF is resolved per-branch in build-deploy (see "Set environment"
+  # step below) -- Prod and Staging now have separate job definitions
+  # (terraform/main.tf and terraform/environments/staging/main.tf), so there's
+  # no longer one fixed name to hardcode here.
 
 # ── Job 1: Test ───────────────────────────────────────────────────────────────
 jobs:
@@ -73,13 +79,28 @@ jobs:
   build-deploy:
     name: Build → ECR → Batch Job Definition
     needs: test
-    # Only run on direct pushes to master (not PRs)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    # Only run on direct pushes to master or staging (not PRs, not other branches)
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/staging')
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      # Prod (master) keeps the original, pre-existing job definition name
+      # ("nuru-stage4-planting-engine") -- nothing about its identity
+      # changes here. Staging is new: it gets its own name, provisioned in
+      # terraform/environments/staging/main.tf, so it has a real deploy
+      # target that didn't exist before this.
+      - name: Set environment
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/master" ]]; then
+            echo "ENV_NAME=prod" >> $GITHUB_ENV
+            echo "BATCH_JOB_DEF=nuru-stage4-planting-engine" >> $GITHUB_ENV
+          else
+            echo "ENV_NAME=staging" >> $GITHUB_ENV
+            echo "BATCH_JOB_DEF=stage4-planting-engine-job-staging" >> $GITHUB_ENV
+          fi
 
       # Short SHA used as the immutable image tag (e.g. git-a3f2c1d)
       - name: Derive image tag
@@ -99,20 +120,29 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       # ── Docker build & push ──────────────────────────────────────────────────
+      # :latest is only pushed for Prod -- it implies "the current production
+      # image", and nothing here actually consumes it (Batch is pinned to the
+      # sha tag below), but a Staging push overwriting a tag named "latest"
+      # is exactly the same shared-target mistake this whole change is fixing
+      # elsewhere, so it shouldn't get a pass here.
       - name: Build Docker image
         run: |
           docker build \
             --tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.sha_tag }} \
-            --tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest \
             --label "git.sha=${{ github.sha }}" \
             --label "git.ref=${{ github.ref }}" \
             --label "build.date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
             .
+          if [[ "$ENV_NAME" == "prod" ]]; then
+            docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.sha_tag }} ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+          fi
 
-      - name: Push image to ECR (sha tag + latest)
+      - name: Push image to ECR
         run: |
           docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.sha_tag }}
-          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+          if [[ "$ENV_NAME" == "prod" ]]; then
+            docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+          fi
 
       # ── Register new Batch Job Definition revision ────────────────────────────
       # We point the revision at the immutable git-sha tag, not :latest,
@@ -120,6 +150,12 @@ jobs:
       - name: Register Batch Job Definition revision
         id: register-job-def
         run: |
+          if [[ "$ENV_NAME" == "prod" ]]; then
+            LOG_GROUP="/aws/batch/nuru-stage4-planting-engine"
+          else
+            LOG_GROUP="/aws/batch/nuru-stage4-planting-engine-staging"
+          fi
+
           REVISION=$(aws batch register-job-definition \
             --job-definition-name "${{ env.BATCH_JOB_DEF }}" \
             --type container \
@@ -147,7 +183,7 @@ jobs:
             "logConfiguration": {
               "logDriver": "awslogs",
               "options": {
-                "awslogs-group":         "/aws/batch/nuru-stage4-planting-engine",
+                "awslogs-group":         "$LOG_GROUP",
                 "awslogs-region":        "eu-north-1",
                 "awslogs-stream-prefix": "batch"
               }
