@@ -17,8 +17,11 @@
 #
 # Required GitHub repo secrets (Settings → Secrets → Actions):
 #   AWS_ACCESS_KEY_ID       IAM key with ECR push + Batch RegisterJobDefinition
+#                           + secretsmanager:DescribeSecret on nuru/datacube/prod
 #   AWS_SECRET_ACCESS_KEY   Matching secret
-#   POSTGIS_PASSWORD        DB password injected into Job Definition env vars
+#   (POSTGIS_PASSWORD is no longer read here -- Batch resolves it from
+#    Secrets Manager via containerProperties.secrets instead, see
+#    terraform/main.tf's aws_secretsmanager_secret.datacube_prod)
 #   VISUAL_CROSSING_API_KEY Climate API key injected into Job Definition env vars
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -156,6 +159,15 @@ jobs:
             LOG_GROUP="/aws/batch/nuru-stage4-planting-engine-staging"
           fi
 
+          # Both Prod's and Staging's job definitions point at the SAME
+          # secret (nuru/datacube/prod) -- Staging still connects to the
+          # shared Prod Datacube (see terraform/environments/staging/main.tf's
+          # comments on why), so there's no separate Staging secret to pick
+          # between yet. Looked up by name at runtime rather than hardcoding
+          # the ARN, since Secrets Manager ARNs include a random suffix that
+          # would change if the secret were ever deleted and recreated.
+          DATACUBE_SECRET_ARN=$(aws secretsmanager describe-secret --secret-id nuru/datacube/prod --query ARN --output text)
+
           REVISION=$(aws batch register-job-definition \
             --job-definition-name "${{ env.BATCH_JOB_DEF }}" \
             --type container \
@@ -175,10 +187,12 @@ jobs:
               { "name": "POSTGIS_PORT",             "value": "5432" },
               { "name": "POSTGIS_DB",               "value": "postgres" },
               { "name": "POSTGIS_USER",             "value": "postgres" },
-              { "name": "POSTGIS_PASSWORD",         "value": "${{ secrets.POSTGIS_PASSWORD }}" },
               { "name": "VISUAL_CROSSING_API_KEY",  "value": "${{ secrets.VISUAL_CROSSING_API_KEY }}" },
               { "name": "S3_BUCKET",                "value": "nuru-datacube-prod-storage" },
               { "name": "AWS_REGION",               "value": "eu-north-1" }
+            ],
+            "secrets": [
+              { "name": "POSTGIS_PASSWORD", "valueFrom": "$DATACUBE_SECRET_ARN:password::" }
             ],
             "logConfiguration": {
               "logDriver": "awslogs",
