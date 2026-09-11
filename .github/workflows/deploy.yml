@@ -168,6 +168,15 @@ jobs:
           # would change if the secret were ever deleted and recreated.
           DATACUBE_SECRET_ARN=$(aws secretsmanager describe-secret --secret-id nuru/datacube/prod --query ARN --output text)
 
+          # nuru/pipeline/shared-secrets holds VISUAL_CROSSING_API_KEY (and
+          # other cross-pipeline credentials) -- shared between Prod and
+          # Staging, same value either way, so no per-environment secret
+          # needed here either. Was previously a plaintext "environment"
+          # entry sourced from the VISUAL_CROSSING_API_KEY GitHub secret;
+          # that GitHub secret is no longer read here and can be removed
+          # from repo settings once this change is confirmed live.
+          PIPELINE_SECRET_ARN=$(aws secretsmanager describe-secret --secret-id nuru/pipeline/shared-secrets --query ARN --output text)
+
           REVISION=$(aws batch register-job-definition \
             --job-definition-name "${{ env.BATCH_JOB_DEF }}" \
             --type container \
@@ -187,12 +196,12 @@ jobs:
               { "name": "POSTGIS_PORT",             "value": "5432" },
               { "name": "POSTGIS_DB",               "value": "postgres" },
               { "name": "POSTGIS_USER",             "value": "postgres" },
-              { "name": "VISUAL_CROSSING_API_KEY",  "value": "${{ secrets.VISUAL_CROSSING_API_KEY }}" },
               { "name": "S3_BUCKET",                "value": "nuru-datacube-prod-storage" },
               { "name": "AWS_REGION",               "value": "eu-north-1" }
             ],
             "secrets": [
-              { "name": "POSTGIS_PASSWORD", "valueFrom": "$DATACUBE_SECRET_ARN:password::" }
+              { "name": "POSTGIS_PASSWORD", "valueFrom": "$DATACUBE_SECRET_ARN:password::" },
+              { "name": "VISUAL_CROSSING_API_KEY", "valueFrom": "$PIPELINE_SECRET_ARN:visual_crossing_api_key::" }
             ],
             "logConfiguration": {
               "logDriver": "awslogs",
