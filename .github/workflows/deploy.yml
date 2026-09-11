@@ -155,9 +155,16 @@ jobs:
         run: |
           if [[ "$ENV_NAME" == "prod" ]]; then
             LOG_GROUP="/aws/batch/nuru-stage4-planting-engine"
+            JOB_ROLE_ARN="arn:aws:iam::741448918017:role/nuru-crop-classifier-prod-batch-role"
           else
             LOG_GROUP="/aws/batch/nuru-stage4-planting-engine-staging"
+            JOB_ROLE_ARN="arn:aws:iam::741448918017:role/nuru-crop-classifier-staging-batch-role"
           fi
+          # Was CropTypeClassification-Batch-Role for both environments --
+          # confirmed live, same jobRoleArn on Prod's and Staging's job
+          # definitions, meaning a compromised Staging container could act
+          # with Prod's exact task-role permissions. Terraform now creates
+          # both dedicated roles (main.tf / environments/staging/main.tf).
 
           # Both Prod's and Staging's job definitions point at the SAME
           # secret (nuru/datacube/prod) -- Staging still connects to the
@@ -189,7 +196,7 @@ jobs:
               { "type": "MEMORY", "value": "16384"  }
             ],
             "executionRoleArn": "arn:aws:iam::741448918017:role/ecsTaskExecutionRole",
-            "jobRoleArn":       "arn:aws:iam::741448918017:role/CropTypeClassification-Batch-Role",
+            "jobRoleArn":       "$JOB_ROLE_ARN",
             "environment": [
               { "name": "POSTGIS_HOST",             "value": "10.0.101.32" },
               { "name": "POSTGIS_HOST_PRIVATE",     "value": "10.0.101.32" },
