@@ -12,7 +12,15 @@ Responsibilities
 3.  get_ndvi_series()     — READ from timeseries.farm_indices (cache).
 4.  get_sar_series()      — READ from timeseries.farm_indices (cache).
 5.  get_climate_series()  — Cache-first: climate_daily → VisualCrossing API.
-6.  upsert_planting_result() — Bulk UPSERT back to spatial.farm_intelligence.
+6.  upsert_planting_results() — Bulk UPSERT, in one transaction, to BOTH:
+      - spatial.farm_intelligence     (current-state cache, one row per
+                                        farm — unchanged historical shape,
+                                        used by the Django API for fast
+                                        "this farm's current planting
+                                        date" reads)
+      - spatial.farm_season_results   (history, one row per farm × season
+                                        × year — see migrations/0001_*.sql
+                                        for why this table exists)
 
 Data flow
 ---------
@@ -22,7 +30,15 @@ The batch script (run_datacube_batch.py) controls the fetch flow:
   3. Call get_ndvi_series() / get_sar_series() to read from that cache.
   4. Call get_climate_series() (VisualCrossing fetches and caches automatically).
   5. Run PlantingDateEnsemble.
-  6. Call upsert_planting_result().
+  6. Call upsert_planting_results().
+
+Schema dependency
+------------------
+DatacubeClient._verify_schema() checks for spatial.farm_season_results at
+startup and raises immediately (before any STAC fetching) if it's missing,
+rather than failing deep inside a threaded upsert call. Run
+migrations/0001_create_farm_season_results.sql against the target DB
+before deploying this module.
 """
 from __future__ import annotations
 
@@ -187,6 +203,113 @@ WHERE NOT EXISTS (
 )
 """
 
+# Same 16-column shape and row order as _UPSERT_PLANTING_SQL's `incoming`
+# CTE above — both statements are executed against the exact same `rows`
+# list built in upsert_planting_results(), just targeting two different
+# tables (see migrations/0001_create_farm_season_results.sql for why).
+#
+# Unlike farm_intelligence's manual WITH-CTE UPDATE/INSERT split (needed
+# there because of pre-existing constraint quirks — see commit
+# "Make planting upsert independent of unique constraint"), this table's
+# PRIMARY KEY (farm_uuid, planting_season, planting_year) is defined by us
+# in the migration, so a plain ON CONFLICT DO UPDATE is safe and simpler.
+_UPSERT_SEASON_RESULT_SQL = """
+WITH incoming (
+    farm_uuid,
+    planting_date,
+    planting_season,
+    planting_year,
+    planting_confidence,
+    planting_confidence_level,
+    planting_method,
+    peak_ndvi,
+    peak_ndvi_date,
+    senescence_date,
+    season_length_days,
+    ndvi_integral,
+    ndvi_rise_rate,
+    total_rainfall_mm,
+    planting_processed_at,
+    updated_at
+) AS (
+    VALUES %s
+)
+INSERT INTO spatial.farm_season_results (
+    farm_uuid, planting_season, planting_year, crop_season,
+    planting_date, planting_confidence, planting_confidence_level,
+    planting_method, peak_ndvi, peak_ndvi_date, senescence_date,
+    season_length_days, ndvi_integral, ndvi_rise_rate, total_rainfall_mm,
+    planting_processed_at, updated_at
+)
+SELECT
+    i.farm_uuid, i.planting_season, i.planting_year,
+    i.planting_year::text || '_' || i.planting_season,
+    i.planting_date, i.planting_confidence, i.planting_confidence_level,
+    i.planting_method, i.peak_ndvi, i.peak_ndvi_date, i.senescence_date,
+    i.season_length_days, i.ndvi_integral, i.ndvi_rise_rate, i.total_rainfall_mm,
+    i.planting_processed_at, i.updated_at
+FROM incoming i
+-- Defense-in-depth: run_datacube_batch.py's _persistable_results() already
+-- filters out empty/failed detections before this is called, but this
+-- table should never accept a NULL planting_date regardless of caller.
+WHERE i.planting_date IS NOT NULL
+ON CONFLICT (farm_uuid, planting_season, planting_year) DO UPDATE SET
+    crop_season                = EXCLUDED.crop_season,
+    planting_date               = EXCLUDED.planting_date,
+    planting_confidence         = EXCLUDED.planting_confidence,
+    planting_confidence_level   = EXCLUDED.planting_confidence_level,
+    planting_method             = EXCLUDED.planting_method,
+    peak_ndvi                   = EXCLUDED.peak_ndvi,
+    peak_ndvi_date              = EXCLUDED.peak_ndvi_date,
+    senescence_date             = EXCLUDED.senescence_date,
+    season_length_days          = EXCLUDED.season_length_days,
+    ndvi_integral                = EXCLUDED.ndvi_integral,
+    ndvi_rise_rate               = EXCLUDED.ndvi_rise_rate,
+    total_rainfall_mm            = EXCLUDED.total_rainfall_mm,
+    planting_processed_at        = EXCLUDED.planting_processed_at,
+    updated_at                   = EXCLUDED.updated_at
+    -- created_at intentionally omitted: preserves the first-detected
+    -- timestamp for this farm+season across re-runs.
+"""
+
+_CHECK_SEASON_RESULTS_TABLE_SQL = "SELECT to_regclass('spatial.farm_season_results')"
+
+
+# ── Pure row builder (unit-testable without a DB connection) ──────────────────
+
+def _build_planting_result_row(farm_uuid: str, sr: SeasonResult) -> tuple:
+    """
+    Build the 16-column row tuple shared by both _UPSERT_PLANTING_SQL and
+    _UPSERT_SEASON_RESULT_SQL. Column count/order MUST match both SQL
+    statements' `incoming` CTEs and _UPSERT_VALUES_TEMPLATE exactly — this
+    repo has shipped a column-count mismatch here before (see commit
+    "Fix planting upsert value count"), hence this is a standalone,
+    directly-testable function rather than inlined in the DB call.
+    """
+    from datetime import datetime as dt
+
+    n = sr.ndvi_signal
+    r = sr.rainfall_signal
+    now_utc = dt.utcnow()
+    return (
+        farm_uuid,
+        sr.estimated_planting_date,        # planting_date
+        sr.season,                         # planting_season
+        sr.year,                           # planting_year
+        sr.confidence,                     # planting_confidence
+        sr.confidence_level,               # planting_confidence_level
+        sr.method_used,                    # planting_method
+        n.peak_ndvi,                       # peak_ndvi
+        n.peak_date,                       # peak_ndvi_date
+        n.senescence_date,                 # senescence_date
+        n.season_length_days,              # season_length_days
+        n.ndvi_integral,                   # ndvi_integral
+        n.ndvi_rise_rate,                  # ndvi_rise_rate
+        r.total_seasonal_rainfall_mm,      # total_rainfall_mm
+        now_utc,                           # planting_processed_at
+        now_utc,                           # updated_at
+    )
+
 
 class DatacubeClient:
     """
@@ -223,12 +346,32 @@ class DatacubeClient:
         )
         # Connectivity test
         conn = pool.getconn()
-        with conn.cursor() as cur:
-            cur.execute("SELECT version();")
-            ver = cur.fetchone()[0]
-            logger.info("PostGIS OK — %s", ver[:60])
-        pool.putconn(conn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT version();")
+                ver = cur.fetchone()[0]
+                logger.info("PostGIS OK — %s", ver[:60])
+            self._verify_schema(conn)
+        finally:
+            pool.putconn(conn)
         return pool
+
+    def _verify_schema(self, conn) -> None:
+        """
+        Fail fast, with a clear message, if a schema this client depends
+        on hasn't been migrated yet — rather than failing deep inside a
+        threaded upsert call after 6+ hours of STAC fetching work.
+        """
+        with conn.cursor() as cur:
+            cur.execute(_CHECK_SEASON_RESULTS_TABLE_SQL)
+            exists = cur.fetchone()[0] is not None
+        if not exists:
+            raise RuntimeError(
+                "spatial.farm_season_results does not exist. Run "
+                "migrations/0001_create_farm_season_results.sql against "
+                "this database before running Stage 4 — see that file's "
+                "header for why this table is required."
+            )
 
     def _resolve_host(self) -> str:
         """Use private VPC host inside AWS, public/tunnel host otherwise."""
@@ -381,13 +524,28 @@ class DatacubeClient:
 
     # ── Result writer ──────────────────────────────────────────────────────────
 
+    # Shared by both _UPSERT_PLANTING_SQL and _UPSERT_SEASON_RESULT_SQL —
+    # identical 16-column shape/order, just targeting two different tables.
+    _UPSERT_VALUES_TEMPLATE = (
+        "(%s::uuid, %s::date, %s, %s::smallint, %s::float, %s, %s, "
+        "%s::float, %s::date, %s::date, %s::smallint, %s::float, %s::float, "
+        "%s::float, %s::timestamptz, %s::timestamptz)"
+    )
+
     def upsert_planting_results(
         self,
         results: List[tuple],   # list of (farm_uuid, SeasonResult) pairs
         dry_run: bool = False,
     ) -> int:
         """
-        Bulk UPSERT planting date + phenology into spatial.farm_intelligence.
+        Bulk UPSERT planting date + phenology, in ONE transaction, into:
+          - spatial.farm_intelligence   (current-state cache, unchanged shape)
+          - spatial.farm_season_results (history — see migrations/0001_*.sql)
+
+        Same transaction deliberately: if either write fails, both roll
+        back. A farm_intelligence row should never be updated without a
+        matching season-history row being recorded for it, or the two
+        tables silently drift apart.
 
         Parameters
         ----------
@@ -396,35 +554,12 @@ class DatacubeClient:
 
         Returns
         -------
-        Number of rows upserted.
+        Number of rows upserted (per table).
         """
         if not results:
             return 0
 
-        from datetime import datetime as dt
-        rows = []
-        for farm_uuid, sr in results:
-            n = sr.ndvi_signal
-            r = sr.rainfall_signal
-            now_utc = dt.utcnow()
-            rows.append((
-                farm_uuid,
-                sr.estimated_planting_date,       # planting_date
-                sr.season,                         # planting_season
-                sr.year,                           # planting_year
-                sr.confidence,                     # planting_confidence
-                sr.confidence_level,               # planting_confidence_level
-                sr.method_used,                    # planting_method
-                n.peak_ndvi,                       # peak_ndvi
-                n.peak_date,                       # peak_ndvi_date
-                n.senescence_date,                 # senescence_date
-                n.season_length_days,              # season_length_days
-                n.ndvi_integral,                   # ndvi_integral
-                n.ndvi_rise_rate,                  # ndvi_rise_rate
-                r.total_seasonal_rainfall_mm,      # total_rainfall_mm
-                now_utc,                           # planting_processed_at
-                now_utc,                           # updated_at
-            ))
+        rows = [_build_planting_result_row(farm_uuid, sr) for farm_uuid, sr in results]
 
         if dry_run:
             logger.info("[DRY RUN] Would upsert %d planting result rows — skipping DB write", len(rows))
@@ -434,18 +569,18 @@ class DatacubeClient:
         try:
             with conn.cursor() as cur:
                 psycopg2.extras.execute_values(
-                    cur,
-                    _UPSERT_PLANTING_SQL,
-                    rows,
-                    template=(
-                        "(%s::uuid, %s::date, %s, %s::smallint, %s::float, %s, %s, "
-                        "%s::float, %s::date, %s::date, %s::smallint, %s::float, %s::float, "
-                        "%s::float, %s::timestamptz, %s::timestamptz)"
-                    ),
-                    page_size=500,
+                    cur, _UPSERT_PLANTING_SQL, rows,
+                    template=self._UPSERT_VALUES_TEMPLATE, page_size=500,
+                )
+                psycopg2.extras.execute_values(
+                    cur, _UPSERT_SEASON_RESULT_SQL, rows,
+                    template=self._UPSERT_VALUES_TEMPLATE, page_size=500,
                 )
             conn.commit()
-            logger.info("Upserted %d planting results into spatial.farm_intelligence", len(rows))
+            logger.info(
+                "Upserted %d planting results into spatial.farm_intelligence "
+                "and spatial.farm_season_results", len(rows),
+            )
             return len(rows)
         except Exception as exc:
             conn.rollback()

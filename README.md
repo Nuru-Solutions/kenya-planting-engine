@@ -46,9 +46,14 @@ kenya_planting_engine/
 │       ├── sentinel1.py    # Sentinel-1 SAR fetcher
 │       └── chirps.py       # CHIRPS rainfall fetcher
 ├── scripts/
-│   └── run_multiseasonal.py  ← MAIN ENTRYPOINT
+│   ├── run_multiseasonal.py    ← file/GEE-mode entrypoint
+│   └── run_datacube_batch.py   ← production (--datacube) entrypoint, AWS Batch
+├── migrations/
+│   └── 0001_create_farm_season_results.sql  # run before deploying run_datacube_batch.py
 ├── tests/
-│   └── test_all.py           # 30 unit tests (no GEE needed)
+│   ├── test_all.py           # detection algorithm tests (rainfall/NDVI/SAR/ensemble)
+│   ├── test_contracts.py     # orchestration contract tests (see Pre-push validation)
+│   └── test_datacube_client.py  # DB-write-path unit tests (mocked psycopg2)
 ├── secrets/
 │   └── gee-credentials.json  ← your service account (already included)
 ├── digifarms_with_aez.geojson
@@ -94,6 +99,27 @@ After that, `git push` runs `pytest tests/ -q` automatically and blocks the
 push on failure. See `.githooks/pre-push` and `tests/test_contracts.py` for
 what's covered and why. Skip in a genuine emergency with `git push --no-verify`
 (CI still runs the full suite on the PR either way).
+
+## Database schema (production / `--datacube` mode)
+
+`scripts/run_datacube_batch.py` writes each detection to **two** tables in
+one transaction — they answer different questions and neither is a subset
+of the other:
+
+| Table | Grain | Purpose |
+|-------|-------|---------|
+| `spatial.farm_intelligence` | one row per farm | **Current state** — fast-read cache for the Django API ("what's this farm's planting date right now"). Gets overwritten every time a *newer* season is processed for that farm. |
+| `spatial.farm_season_results` | one row per (farm, season, year) | **History** — the only source of truth for "what was farm X's planting date in Long Rains 2025 specifically". Never overwritten by a different season; re-running the *same* season updates its row in place as more satellite data accumulates. |
+
+Any query that needs season-over-season data (yield trend analysis, a QA
+coverage dashboard, an audit of a specific past season) must use
+`farm_season_results`, not `farm_intelligence`.
+
+Run `migrations/0001_create_farm_season_results.sql` against a database
+before deploying code that targets it — `DatacubeClient` checks for the
+table at startup and fails fast with a pointer back to that file if it's
+missing, rather than failing deep inside a threaded upsert call after
+hours of STAC fetching.
 
 ## Output files (saved to `outputs/`)
 
