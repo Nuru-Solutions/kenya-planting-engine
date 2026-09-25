@@ -104,6 +104,29 @@ def _resolve_db_host(settings) -> str:
     return host
 
 
+def _sample_items_evenly(items: list, max_items: int) -> list:
+    """
+    Return at most max_items entries from a datetime-ascending-sorted list,
+    spread evenly across its full range.
+
+    A hard items[:max_items] slice silently drops the back half of a long
+    season — for a ~150-day window at 5-day S2 revisit that's ~30 scenes,
+    so a cap of 20 was truncating fetches before green-up/tillage typically
+    occurs, starving the NDVI/SAR detectors of in-season data. Pure/stateless
+    so it can be unit-tested without a STAC connection.
+    """
+    n = len(items)
+    if n <= max_items:
+        return items
+    if max_items <= 1:
+        return [items[-1]]
+    # Endpoint-inclusive linspace over indices 0..n-1 so the first AND last
+    # scene are always kept (not just "roughly" — a plain n/max_items step
+    # can round short of n-1, silently dropping the latest scene again).
+    idxs = sorted({round(i * (n - 1) / (max_items - 1)) for i in range(max_items)})
+    return [items[i] for i in idxs]
+
+
 def _get_tile_items(stac_client: Client, collection: str, tile_id: str,
                     start: date, end: date, max_cloud: int, max_items: int,
                     bbox: Optional[list[float]] = None) -> list:
@@ -143,9 +166,18 @@ def _get_tile_items(stac_client: Client, collection: str, tile_id: str,
         tile_items = items
 
     tile_items.sort(key=lambda x: x.datetime)
-    logger.info("STAC [%s] tile=%s: found %d items (%s → %s)",
-                collection, tile_id, len(tile_items[:max_items]), start, end)
-    return tile_items[:max_items]
+
+    total_found = len(tile_items)
+    tile_items = _sample_items_evenly(tile_items, max_items)
+    if total_found > max_items:
+        logger.info(
+            "STAC [%s] tile=%s: found %d items (%s → %s) — sampled down to %d across full range",
+            collection, tile_id, total_found, start, end, len(tile_items),
+        )
+    else:
+        logger.info("STAC [%s] tile=%s: found %d items (%s → %s)",
+                    collection, tile_id, total_found, start, end)
+    return tile_items
 
 
 

@@ -78,6 +78,23 @@ python scripts/run_multiseasonal.py
 python scripts/run_multiseasonal.py --years 2023 2024 2025
 ```
 
+## Pre-push validation
+
+This repo ships a git hook that runs the test suite (algorithm correctness +
+orchestration contracts — season auto-detect, what gets persisted, tile fetch
+windows, downstream webhook/Stage-5 chaining) before every `git push`.
+
+One-time setup per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+After that, `git push` runs `pytest tests/ -q` automatically and blocks the
+push on failure. See `.githooks/pre-push` and `tests/test_contracts.py` for
+what's covered and why. Skip in a genuine emergency with `git push --no-verify`
+(CI still runs the full suite on the PR either way).
+
 ## Output files (saved to `outputs/`)
 
 | File | Description |
