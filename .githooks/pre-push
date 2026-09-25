@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Stage 4 (Planting Date Engine) pre-push validation.
+#
+# One-time setup per clone:
+#   git config core.hooksPath .githooks
+#
+# What this runs and why:
+#   tests/test_all.py       - detection algorithm correctness (rainfall/NDVI/SAR/ensemble)
+#   tests/test_contracts.py - orchestration invariants that don't live in the maths:
+#                               * season auto-detect never points at a window that
+#                                 hasn't opened yet (the Jan short_rains/year bug)
+#                               * a pure calendar-fallback guess is never written to
+#                                 spatial.farm_intelligence as if it were a detection
+#                               * a tile's STAC fetch window covers every AEZ present,
+#                                 not just farm[0]'s
+#                               * STAC scene sampling keeps the full season span
+#                               * the Django webhook / Stage 5 trigger fire exactly
+#                               * once per run, and never with a hardcoded secret
+#
+# This is intentionally fast (no DB/AWS/STAC calls — everything network-bound is
+# mocked or extracted into pure functions) so it's safe to run on every push.
+# Deeper checks (DB integration, live dry-run against prod farms) belong in CI /
+# the deploy gate, not here.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "── Stage 4 pre-push validation ──────────────────────────────────"
+
+# Prefer `python -m pytest` over a bare `pytest` — on Windows/Git Bash the
+# pytest console-script entry point often isn't on PATH even though the
+# package is installed for the active `python`.
+PYTHON="$(command -v python || command -v python3 || true)"
+if [ -z "$PYTHON" ] || ! "$PYTHON" -c "import pytest" >/dev/null 2>&1; then
+    echo "⚠️  python/pytest not available — skipping pre-push tests."
+    echo "    Install deps first: pip install -r requirements.txt"
+    echo "    (not blocking push, but CI will still run the full suite)"
+    exit 0
+fi
+
+echo "Running tests/ (via $PYTHON -m pytest) …"
+if ! "$PYTHON" -m pytest tests/ -q; then
+    echo ""
+    echo "❌ Pre-push validation FAILED — push aborted."
+    echo "   Fix the failing test(s) above, or in a real emergency:"
+    echo "     git push --no-verify"
+    exit 1
+fi
+
+echo "✅ Pre-push validation passed."

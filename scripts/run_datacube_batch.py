@@ -60,18 +60,180 @@ logger = logging.getLogger(__name__)
 
 # ── Season auto-detect ─────────────────────────────────────────────────────────
 
-def _auto_detect_season(year: int) -> str:
+def _auto_detect_season(today: date | None = None) -> tuple[str, int]:
     """
-    Infer the most recent completable season based on today's date.
-    Long Rains ends ~May, Short Rains ends ~Dec.
+    Infer the most recently completed (or currently in-progress) season
+    AND its crop-calendar year, based on today's date.
+
+    Returns (season, year) rather than season alone. Short Rains windows
+    are anchored to the October they *start* in — SeasonWindow.get_window()
+    wraps the end date into Jan/Feb of year+1 for AEZs like LM4 — so in
+    January the SR season that just finished belongs to *last* year, not
+    this one. Pairing "short_rains" with today.year there points
+    resolve_season() at an Oct-Dec window that is still ~9 months in the
+    future: every farm gets zero satellite/rainfall observations and falls
+    back to the hardcoded climatological date (see PlantingDateEnsemble's
+    fallback_climatology path), which then gets upserted as if it were a
+    real detection.
     """
-    today = date.today()
+    today = today or date.today()
+    year  = today.year
+
     if 6 <= today.month <= 9:
-        # After LR harvest window — process Short Rains
-        return "long_rains"
-    if today.month >= 10 or today.month <= 1:
-        return "short_rains"
-    return "long_rains"
+        # After LR harvest, before SR opens — most recently completed
+        # season is this year's Long Rains.
+        return "long_rains", year
+    if today.month == 1:
+        # This year's Short Rains hasn't opened yet (starts October);
+        # the SR season currently wrapping up started *last* October.
+        return "short_rains", year - 1
+    if today.month >= 10:
+        return "short_rains", year
+    return "long_rains", year
+
+
+# ── Downstream chaining (Django webhook + Stage 5 trigger) ────────────────────
+
+def _trigger_downstream(dry_run: bool) -> None:
+    """
+    1. PATCH Django FarmUploadPipelineStatusView: planting_date=completed
+       (CSV-upload runs only — UPLOAD_ID unset on scheduled cron runs).
+    2. Invoke nuru-start-crop-health-pipeline (fire-and-forget) to chain
+       into Stage 5, forwarding UPLOAD_ID so it can report its own
+       completion back to Django.
+
+    Both calls are non-fatal and never affect exit code.
+
+    Skipped on AWS Batch retry attempts (AWS_BATCH_JOB_ATTEMPT != "1"):
+    Batch retries the WHOLE job on a non-zero exit code, and this function
+    runs at the very end of a successful pass — so if attempt 1 reached
+    here, it already fired both calls. Re-running on attempt 2+ would
+    report "completed" and invoke Stage 5 a second time for the same
+    UPLOAD_ID. (If attempt 1 crashed *before* reaching here, attempt 2 will
+    correctly fire once it completes — attempt 2's own AWS_BATCH_JOB_ATTEMPT
+    is "2", but it is the first attempt to actually reach this function.)
+    """
+    import os as _os, json as _json, urllib.request as _urllib_req
+
+    attempt = _os.environ.get("AWS_BATCH_JOB_ATTEMPT")
+    if attempt and attempt != "1":
+        logger.info(
+            "AWS_BATCH_JOB_ATTEMPT=%s (retry) — skipping downstream chaining to "
+            "avoid double-firing the Django webhook / Stage 5 trigger",
+            attempt,
+        )
+        return
+
+    upload_id        = _os.environ.get("UPLOAD_ID")
+    webhook_template = _os.environ.get(
+        "GPS_RESULT_WEBHOOK_URL_TEMPLATE",
+        "https://api.nuru.solutions/organization/upload-status/{upload_id}/pipeline/",
+    )
+    webhook_secret = _os.environ.get("GPS_RESULT_WEBHOOK_SECRET")
+
+    # 1. Report planting_date = "completed" to Django (CSV upload runs only)
+    if not upload_id or dry_run:
+        logger.info("No UPLOAD_ID set or dry-run — skipping planting_date webhook")
+    elif not webhook_secret:
+        logger.error(
+            "GPS_RESULT_WEBHOOK_SECRET not set — skipping planting_date webhook "
+            "for upload_id=%s (refusing to fall back to a hardcoded default secret)",
+            upload_id,
+        )
+    else:
+        try:
+            url     = webhook_template.format(upload_id=upload_id)
+            payload = _json.dumps({"pipeline_status": {"planting_date": "completed"}}).encode()
+            req = _urllib_req.Request(
+                url, data=payload,
+                headers={"Content-Type": "application/json",
+                         "X-Pipeline-Key": webhook_secret},
+                method="PATCH",
+            )
+            with _urllib_req.urlopen(req, timeout=10) as resp:
+                logger.info("📡 Planting date completion reported to Django (HTTP %s)", resp.status)
+        except Exception as wh_err:
+            logger.error("Failed to report planting_date completion to Django: %s", wh_err)
+
+    # 2. Trigger Stage 5: Crop Health pipeline.
+    #    Always triggered (scheduled cron runs also need to chain here).
+    #    UPLOAD_ID is forwarded so crop health can report its own completion
+    #    to Django for the correct upload.
+    if not dry_run:
+        import boto3 as _boto3
+        crop_health_lambda = _os.environ.get("CROP_HEALTH_LAMBDA_NAME", "nuru-start-crop-health-pipeline")
+        try:
+            lc = _boto3.client("lambda", region_name=_os.environ.get("AWS_REGION", "eu-north-1"))
+            lc.invoke(
+                FunctionName=crop_health_lambda,
+                InvocationType="Event",
+                Payload=_json.dumps({
+                    "source": "planting-engine",
+                    "upload_id": upload_id,
+                }),
+            )
+            logger.info("🚀 Triggered %s to start Crop Health pipeline (Stage 5)", crop_health_lambda)
+        except Exception as ch_err:
+            logger.error("Failed to trigger Crop Health pipeline: %s", ch_err)
+
+
+# ── Pure helpers (unit-testable without a DB/STAC connection) ─────────────────
+
+def _tile_fetch_window(
+    tile_farms: list[FarmRow],
+    season_str: str,
+    year: int,
+) -> tuple:
+    """
+    Compute the (fetch_start, win_end) STAC search range that covers every
+    distinct AEZ window present in a tile group.
+
+    A single Sentinel-2 tile can contain farms from more than one AEZ, and
+    each AEZ has its own season window (see AEZConfig.seasons). Returns the
+    UNION of all distinct AEZ windows in this tile_farms group, plus the
+    usual 60-day pre-season baseline padding on the start.
+    """
+    from datetime import timedelta
+
+    distinct_aez_codes = {f.aez_code for f in tile_farms}
+    windows = [
+        resolve_season(season_str, year, get_aez_config(code))[1]
+        for code in distinct_aez_codes
+    ]
+    fetch_start = min(w.get_search_start(year) for w in windows) - timedelta(days=60)
+    win_end     = max(w.get_window(year)[1] for w in windows)
+    return fetch_start, win_end
+
+
+def _persistable_results(
+    tile_results: list[tuple[str, SeasonResult]],
+) -> tuple[list[tuple[str, SeasonResult]], int, int]:
+    """
+    Filter detection results down to the ones safe to upsert.
+
+    Excludes:
+      - errored results
+      - empty results (estimated_planting_date is None)
+      - "fallback_climatology": ALL THREE signals were unavailable, so the
+        date is just the AEZ's hardcoded calendar default, not a detection
+        from this farm's actual data. Persisting it would stamp
+        planting_processed_at (30-day retry cooldown) and hide the farm
+        from Stage 4 eligibility even though nothing was actually observed.
+
+    Returns (ok_results, n_skipped, n_calendar_only).
+    """
+    ok_results = [
+        (fuid, r) for fuid, r in tile_results
+        if not r.error
+        and r.estimated_planting_date is not None
+        and r.method_used != "fallback_climatology"
+    ]
+    n_skipped = len(tile_results) - len(ok_results)
+    n_clim_only = sum(
+        1 for _, r in tile_results
+        if not r.error and r.method_used == "fallback_climatology"
+    )
+    return ok_results, n_skipped, n_clim_only
 
 
 # ── Per-farm worker ────────────────────────────────────────────────────────────
@@ -130,6 +292,10 @@ def run_batch_pipeline(
         farms = dc.get_eligible_farms(batch_size=batch_size)
         if not farms:
             logger.info("✅ No eligible farms found. Pipeline complete.")
+            # Still chain forward — a CSV-upload run with zero eligible farms
+            # (e.g. crop classifier found nothing plantable) must not leave
+            # its upload_id stuck "in progress" on the Django side forever.
+            _trigger_downstream(dry_run)
             return 0
 
         # ── 3. Group by tile_id (mirrors Stage 3) ──────────────────────────────
@@ -151,12 +317,11 @@ def run_batch_pipeline(
             logger.info("[%d/%d] Tile %s — %d farms", tile_idx, len(tile_groups), tile_id, n)
 
             # ── 4a. Pre-fetch STAC data for this tile → writes to farm_indices ──
+            # Fetch the UNION of all distinct AEZ windows present in this
+            # tile (see _tile_fetch_window docstring) so every farm's window
+            # is fully covered by the shared cache, not just farm[0]'s.
             tile_pairs = [(f.farm_uuid, f.geom_wkt) for f in tile_farms]
-            aez_sample = get_aez_config(tile_farms[0].aez_code)
-            _, sample_window = resolve_season(season_str, year, aez_sample)
-            from datetime import timedelta
-            fetch_start = sample_window.get_search_start(year) - timedelta(days=60)
-            _, win_end  = sample_window.get_window(year)
+            fetch_start, win_end = _tile_fetch_window(tile_farms, season_str, year)
 
             # Sentinel-2 NDVI/EVI/NDWI
             conn_s2 = dc._pool.getconn()
@@ -198,16 +363,15 @@ def run_batch_pipeline(
                         logger.error("Farm %s raised: %s", farm_uuid[:8], exc)
 
             # ── 4c. Bulk upsert results for this tile ───────────────────────────
-            # Only persist successful detections: failed results carry
-            # estimated_planting_date=None and would stamp planting_processed_at
-            # (30-day retry cooldown) or overwrite good data with NULLs.
-            ok_results = [
-                (fuid, r) for fuid, r in tile_results
-                if not r.error and r.estimated_planting_date is not None
-            ]
-            skipped = len(tile_results) - len(ok_results)
+            # See _persistable_results() docstring: excludes failures, empty
+            # detections, and pure calendar-fallback guesses.
+            ok_results, skipped, clim_only = _persistable_results(tile_results)
             if skipped:
-                logger.info("Skipping %d failed/empty detections (not written)", skipped)
+                logger.info(
+                    "Skipping %d failed/empty/calendar-only detections (not written)"
+                    " — %d were pure calendar fallback (no real signal)",
+                    skipped, clim_only,
+                )
             if ok_results:
                 dc.upsert_planting_results(ok_results, dry_run=dry_run)
                 all_upsert_rows.extend(ok_results)
@@ -233,53 +397,7 @@ def run_batch_pipeline(
         logger.info("=" * 65)
 
         # ── Downstream chaining ───────────────────────────────────────────
-        import os as _os, json as _json, urllib.request as _urllib_req
-
-        upload_id        = _os.environ.get("UPLOAD_ID")
-        webhook_template = _os.environ.get(
-            "GPS_RESULT_WEBHOOK_URL_TEMPLATE",
-            "https://api.nuru.solutions/organization/upload-status/{upload_id}/pipeline/",
-        )
-        webhook_secret   = _os.environ.get("GPS_RESULT_WEBHOOK_SECRET", "nuru-gps-webhook-secret-key-12345")
-
-        # 1. Report planting_date = "completed" to Django (CSV upload runs only)
-        if upload_id and not dry_run:
-            try:
-                url     = webhook_template.format(upload_id=upload_id)
-                payload = _json.dumps({"pipeline_status": {"planting_date": "completed"}}).encode()
-                req = _urllib_req.Request(
-                    url, data=payload,
-                    headers={"Content-Type": "application/json",
-                             "X-Pipeline-Key": webhook_secret},
-                    method="PATCH",
-                )
-                with _urllib_req.urlopen(req, timeout=10) as resp:
-                    logger.info("📡 Planting date completion reported to Django (HTTP %s)", resp.status)
-            except Exception as wh_err:
-                logger.error("Failed to report planting_date completion to Django: %s", wh_err)
-        else:
-            logger.info("No UPLOAD_ID set or dry-run — skipping planting_date webhook")
-
-        # 2. Trigger Stage 5: Crop Health pipeline.
-        #    Always triggered (scheduled cron runs also need to chain here).
-        #    UPLOAD_ID is forwarded so crop health can report its own completion
-        #    to Django for the correct upload.
-        if not dry_run:
-            import boto3 as _boto3
-            crop_health_lambda = _os.environ.get("CROP_HEALTH_LAMBDA_NAME", "nuru-start-crop-health-pipeline")
-            try:
-                lc = _boto3.client("lambda", region_name=_os.environ.get("AWS_REGION", "eu-north-1"))
-                lc.invoke(
-                    FunctionName=crop_health_lambda,
-                    InvocationType="Event",
-                    Payload=_json.dumps({
-                        "source": "planting-engine",
-                        "upload_id": upload_id,
-                    }),
-                )
-                logger.info("🚀 Triggered %s to start Crop Health pipeline (Stage 5)", crop_health_lambda)
-            except Exception as ch_err:
-                logger.error("Failed to trigger Crop Health pipeline: %s", ch_err)
+        _trigger_downstream(dry_run)
 
         return 0 if total_failed == 0 else 1
 
@@ -289,8 +407,7 @@ def run_batch_pipeline(
 
 def main() -> None:
     settings = get_settings()
-    default_year   = date.today().year
-    default_season = _auto_detect_season(default_year)
+    default_season, default_year = _auto_detect_season()
 
     parser = argparse.ArgumentParser(
         description="Stage 4: Planting Date Engine — Datacube Batch Runner"
