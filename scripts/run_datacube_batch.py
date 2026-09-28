@@ -92,42 +92,49 @@ def _auto_detect_season(today: date | None = None) -> tuple[str, int]:
     return "long_rains", year
 
 
-# ── Downstream chaining (Django webhook) ───────────────────────────────────────
+# ── Downstream chaining (Django webhook + Stage 5 trigger) ────────────────────
 
 def _trigger_downstream(dry_run: bool) -> None:
     """
-    PATCH Django FarmUploadPipelineStatusView: planting_date=completed
-    (CSV-upload runs only — UPLOAD_ID unset on scheduled cron runs).
+    1. PATCH Django FarmUploadPipelineStatusView: planting_date=completed
+       (CSV-upload runs only — UPLOAD_ID unset on scheduled cron runs).
+    2. Invoke Stage 5 (Crop Health) directly — but ONLY for UPLOAD_ID runs
+       (CSV/API-triggered), not scheduled cron runs. See "Why gated on
+       UPLOAD_ID" below.
 
-    Non-fatal and never affects exit code.
+    Both calls are non-fatal and never affect exit code.
 
-    Does NOT invoke Stage 5 (Crop Health) directly. That used to happen
-    here via a direct lambda.invoke() call, but:
-      1. It targeted "nuru-start-crop-health-pipeline", which has never
-         existed as a deployed function in eu-north-1 (confirmed via
-         `aws lambda get-function` — ResourceNotFoundException).
-      2. Stage 4→5 chaining already happens independently and correctly:
-         an EventBridge rule watches this job's AWS Batch job-state
-         change and invokes nuru-pipeline-chain-coordinator, which
-         submits the next stage's Batch job by job-name prefix. Confirmed
-         live (2026-09-25): a "stage4-planting-engine-scheduled-run" job
-         succeeding triggered the coordinator, which submitted
-         "crop-health-post-chain-*" under job definition "crop-health-job".
-      Keeping the dead direct-invoke here was pure noise (an
-      AccessDeniedException logged as an ERROR on every run) that
-      duplicated working infrastructure. If Stage 5 ever needs a direct
-      trigger from here again, fix the target name and confirm with
-      whoever owns nuru-pipeline-chain-coordinator that it isn't already
-      handling it — don't just re-add the invoke.
+    Target fixed to "crop-health-pipeline-trigger" (confirmed live via
+    `aws lambda get-function`) — the previous target,
+    "nuru-start-crop-health-pipeline", has never existed in eu-north-1.
+    Needs CROP_HEALTH_LAMBDA_NAME env var if that name ever changes.
+    Requires the Batch task role to have lambda:InvokeFunction on this
+    function's ARN — grant this alongside the other IAM fixes.
+
+    Why gated on UPLOAD_ID (not "always", unlike the pre-2026-09 version)
+    -------------------------------------------------------------------
+    Stage 4→5 chaining for SCHEDULED runs already happens independently:
+    an EventBridge rule watches this job's AWS Batch job-state change and
+    invokes nuru-pipeline-chain-coordinator, which submits the next
+    stage's Batch job by job-name prefix (confirmed live 2026-09-25:
+    "stage4-planting-engine-scheduled-run" succeeding → coordinator →
+    "crop-health-post-chain-*"). Firing this invoke unconditionally would
+    double-trigger Stage 5 for every scheduled run once the target name
+    and IAM are fixed — once via the coordinator, once via this call.
+    UPLOAD_ID-driven runs (CSV/API uploads) use ad hoc job names the
+    coordinator's prefix matching won't recognize, so they need this
+    direct path; scheduled runs don't. If that assumption is wrong for
+    your job-naming setup, confirm with whoever owns
+    nuru-pipeline-chain-coordinator before changing this gate.
 
     Skipped on AWS Batch retry attempts (AWS_BATCH_JOB_ATTEMPT != "1"):
     Batch retries the WHOLE job on a non-zero exit code, and this function
     runs at the very end of a successful pass — so if attempt 1 reached
-    here, it already fired the webhook. Re-running on attempt 2+ would
-    report "completed" to Django a second time for the same UPLOAD_ID.
-    (If attempt 1 crashed *before* reaching here, attempt 2 will correctly
-    fire once it completes — attempt 2's own AWS_BATCH_JOB_ATTEMPT is "2",
-    but it is the first attempt to actually reach this function.)
+    here, it already fired both calls. Re-running on attempt 2+ would
+    report "completed" and invoke Stage 5 a second time for the same
+    UPLOAD_ID. (If attempt 1 crashed *before* reaching here, attempt 2 will
+    correctly fire once it completes — attempt 2's own AWS_BATCH_JOB_ATTEMPT
+    is "2", but it is the first attempt to actually reach this function.)
     """
     import os as _os, json as _json, urllib.request as _urllib_req
 
@@ -135,7 +142,7 @@ def _trigger_downstream(dry_run: bool) -> None:
     if attempt and attempt != "1":
         logger.info(
             "AWS_BATCH_JOB_ATTEMPT=%s (retry) — skipping downstream chaining to "
-            "avoid double-firing the Django webhook",
+            "avoid double-firing the Django webhook / Stage 5 trigger",
             attempt,
         )
         return
@@ -170,6 +177,30 @@ def _trigger_downstream(dry_run: bool) -> None:
                 logger.info("📡 Planting date completion reported to Django (HTTP %s)", resp.status)
         except Exception as wh_err:
             logger.error("Failed to report planting_date completion to Django: %s", wh_err)
+
+    # 2. Trigger Stage 5: Crop Health pipeline — UPLOAD_ID runs only.
+    #    See docstring "Why gated on UPLOAD_ID": scheduled runs are
+    #    already chained by nuru-pipeline-chain-coordinator; firing this
+    #    unconditionally would double-trigger Stage 5 for those.
+    if upload_id and not dry_run:
+        import boto3 as _boto3
+        crop_health_lambda = _os.environ.get("CROP_HEALTH_LAMBDA_NAME", "crop-health-pipeline-trigger")
+        try:
+            lc = _boto3.client("lambda", region_name=_os.environ.get("AWS_REGION", "eu-north-1"))
+            lc.invoke(
+                FunctionName=crop_health_lambda,
+                InvocationType="Event",
+                Payload=_json.dumps({
+                    "source": "planting-engine",
+                    "upload_id": upload_id,
+                }),
+            )
+            logger.info("🚀 Triggered %s to start Crop Health pipeline (Stage 5)", crop_health_lambda)
+        except Exception as ch_err:
+            logger.error("Failed to trigger Crop Health pipeline: %s", ch_err)
+    elif not dry_run:
+        logger.debug("No UPLOAD_ID set — scheduled-run Stage 5 chaining is handled by "
+                     "nuru-pipeline-chain-coordinator, not this script")
 
 
 # ── Pure helpers (unit-testable without a DB/STAC connection) ─────────────────

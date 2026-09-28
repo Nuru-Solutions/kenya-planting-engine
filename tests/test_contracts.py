@@ -235,19 +235,21 @@ class TestStacSampling:
         assert all(it in items for it in sampled)
 
 
-# ── Downstream chaining: no duplicate webhook fires, no weak secret ────────────
+# ── Downstream chaining: no duplicate fires, no weak secret, no wrong target ───
 #
-# _trigger_downstream() only reports planting_date=completed to Django now.
-# It does NOT invoke a Stage 5 lambda directly — that call used to target
-# "nuru-start-crop-health-pipeline", which has never existed as a deployed
-# function (confirmed via `aws lambda get-function`). Stage 4→5 chaining
-# happens independently via an EventBridge rule watching this job's AWS
-# Batch job-state change, which invokes nuru-pipeline-chain-coordinator —
-# confirmed live and unrelated to anything in this script.
+# _trigger_downstream() does two things:
+#   1. Reports planting_date=completed to Django (UPLOAD_ID runs only).
+#   2. Invokes Stage 5 (Crop Health) directly — but ONLY for UPLOAD_ID runs.
+#      Scheduled runs are already chained by nuru-pipeline-chain-coordinator
+#      (confirmed live via job-state-change EventBridge rule); firing this
+#      unconditionally would double-trigger Stage 5 for those. Target is
+#      "crop-health-pipeline-trigger" (confirmed live) — NOT
+#      "nuru-start-crop-health-pipeline" (confirmed nonexistent).
 
 class TestTriggerDownstream:
     @mock.patch("urllib.request.urlopen")
-    def test_skips_on_batch_retry_attempt(self, mock_urlopen, monkeypatch):
+    @mock.patch("boto3.client")
+    def test_skips_on_batch_retry_attempt(self, mock_boto_client, mock_urlopen, monkeypatch):
         monkeypatch.setenv("AWS_BATCH_JOB_ATTEMPT", "2")
         monkeypatch.setenv("UPLOAD_ID", "abc123")
         monkeypatch.setenv("GPS_RESULT_WEBHOOK_SECRET", "real-secret")
@@ -255,34 +257,62 @@ class TestTriggerDownstream:
         _trigger_downstream(dry_run=False)
 
         mock_urlopen.assert_not_called()
+        mock_boto_client.assert_not_called()
 
     @mock.patch("urllib.request.urlopen")
+    @mock.patch("boto3.client")
     def test_skips_webhook_without_secret_but_does_not_use_a_hardcoded_default(
-        self, mock_urlopen, monkeypatch
+        self, mock_boto_client, mock_urlopen, monkeypatch
     ):
         monkeypatch.delenv("AWS_BATCH_JOB_ATTEMPT", raising=False)
         monkeypatch.setenv("UPLOAD_ID", "abc123")
         monkeypatch.delenv("GPS_RESULT_WEBHOOK_SECRET", raising=False)
+        mock_boto_client.return_value.invoke.return_value = {}
 
         _trigger_downstream(dry_run=False)
 
         mock_urlopen.assert_not_called()  # never falls back to a known/committed secret
 
     @mock.patch("urllib.request.urlopen")
-    def test_fires_webhook_on_first_attempt_with_secret_set(
-        self, mock_urlopen, monkeypatch
+    @mock.patch("boto3.client")
+    def test_fires_both_on_first_attempt_with_upload_id_and_secret_set(
+        self, mock_boto_client, mock_urlopen, monkeypatch
     ):
         monkeypatch.setenv("AWS_BATCH_JOB_ATTEMPT", "1")
         monkeypatch.setenv("UPLOAD_ID", "abc123")
         monkeypatch.setenv("GPS_RESULT_WEBHOOK_SECRET", "real-secret")
         mock_urlopen.return_value.__enter__.return_value.status = 200
+        mock_boto_client.return_value.invoke.return_value = {}
 
         _trigger_downstream(dry_run=False)
 
         mock_urlopen.assert_called_once()
+        mock_boto_client.return_value.invoke.assert_called_once()
+        _, kwargs = mock_boto_client.return_value.invoke.call_args
+        assert kwargs["FunctionName"] == "crop-health-pipeline-trigger"
 
     @mock.patch("urllib.request.urlopen")
-    def test_dry_run_never_calls_webhook(self, mock_urlopen, monkeypatch):
+    @mock.patch("boto3.client")
+    def test_scheduled_run_without_upload_id_never_invokes_stage5(
+        self, mock_boto_client, mock_urlopen, monkeypatch
+    ):
+        """
+        No UPLOAD_ID => this is a scheduled cron run. Stage 5 chaining for
+        those is nuru-pipeline-chain-coordinator's job (via EventBridge),
+        not this script's — invoking here too would double-trigger it.
+        """
+        monkeypatch.setenv("AWS_BATCH_JOB_ATTEMPT", "1")
+        monkeypatch.delenv("UPLOAD_ID", raising=False)
+        monkeypatch.setenv("GPS_RESULT_WEBHOOK_SECRET", "real-secret")
+
+        _trigger_downstream(dry_run=False)
+
+        mock_urlopen.assert_not_called()   # no upload to report on either
+        mock_boto_client.assert_not_called()
+
+    @mock.patch("urllib.request.urlopen")
+    @mock.patch("boto3.client")
+    def test_dry_run_never_calls_either(self, mock_boto_client, mock_urlopen, monkeypatch):
         monkeypatch.delenv("AWS_BATCH_JOB_ATTEMPT", raising=False)
         monkeypatch.setenv("UPLOAD_ID", "abc123")
         monkeypatch.setenv("GPS_RESULT_WEBHOOK_SECRET", "real-secret")
@@ -290,3 +320,4 @@ class TestTriggerDownstream:
         _trigger_downstream(dry_run=True)
 
         mock_urlopen.assert_not_called()
+        mock_boto_client.assert_not_called()
