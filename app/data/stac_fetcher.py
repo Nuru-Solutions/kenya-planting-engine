@@ -73,7 +73,20 @@ S2_BAND_ASSETS = {
 # rasterio GDAL environment for COG HTTP range requests
 RASTERIO_ENV = dict(
     GDAL_DISABLE_READDIR_ON_OPEN="YES",
-    CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".tif,.TIF",
+    # Must include BOTH .tif (Sentinel-2 COG assets, e.g. B08.tif) and .tiff
+    # (Sentinel-1 L1C assets, e.g. iw-vv.tiff — legacy SAFE-format naming,
+    # double-f). Missing ".tiff"/".TIFF" here silently made GDAL's vsicurl
+    # layer refuse to recognize every Sentinel-1 asset as a valid dataset
+    # at all ("does not exist in the file system, and is not recognized
+    # as a supported dataset name") — regardless of IAM permissions, S3
+    # region, or href path format, all of which look like plausible causes
+    # of that exact error and none of which were it. Reproduced against
+    # the real production image + real S3 object (2026-09-28): identical
+    # credentials, identical href, fails without ".tiff"/".TIFF" here and
+    # succeeds with them. This is why Sentinel-1/SAR has never produced a
+    # signal in production while Sentinel-2/NDVI (all ".tif") has been
+    # unaffected by this specific bug.
+    CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".tif,.TIF,.tiff,.TIFF",
     GDAL_HTTP_MAX_RETRY="3",
     GDAL_HTTP_RETRY_DELAY="2",
     # Requester Pays is required to read Sentinel-1 GRD assets from AWS S3
