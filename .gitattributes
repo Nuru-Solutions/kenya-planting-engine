@@ -1,0 +1,5 @@
+# Shell scripts must keep LF line endings regardless of a clone's
+# core.autocrlf setting — CRLF breaks bash (shebang, `if`/heredoc parsing)
+# and would silently disable the pre-push hook on Windows checkouts.
+*.sh    text eol=lf
+.githooks/*   text eol=lf
