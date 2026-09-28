@@ -207,42 +207,23 @@ def _read_scl_mask(item, minx: float, miny: float, maxx: float, maxy: float,
         return None
 
 
-def _normalize_s1_l1c_href_date(href: str) -> str:
-    """
-    Normalize Sentinel-1 L1C S3 key date segments to zero-padded MM/DD.
-
-    Some STAC items expose hrefs like .../GRD/2026/1/4/... while object keys are
-    stored as .../GRD/2026/01/04/... . This normalizes the known variant.
-    """
-    prefix = "s3://sentinel-s1-l1c/GRD/"
-    if not href.startswith(prefix):
-        return href
-
-    parts = href.split("/")
-    try:
-        grd_idx = parts.index("GRD")
-    except ValueError:
-        return href
-
-    if len(parts) <= grd_idx + 3:
-        return href
-
-    month = parts[grd_idx + 2]
-    day = parts[grd_idx + 3]
-    if month.isdigit() and day.isdigit():
-        parts[grd_idx + 2] = month.zfill(2)
-        parts[grd_idx + 3] = day.zfill(2)
-        return "/".join(parts)
-    return href
-
-
 def _s1_asset_href_candidates(asset_href: str) -> List[str]:
-    """Return candidate hrefs to try for Sentinel-1 assets."""
-    candidates = [asset_href]
-    normalized = _normalize_s1_l1c_href_date(asset_href)
-    if normalized != asset_href:
-        candidates.append(normalized)
-    return candidates
+    """
+    Return candidate hrefs to try for a Sentinel-1 asset.
+
+    Previously this also tried a zero-padded-date variant of the href
+    (".../GRD/2026/1/4/..." -> ".../GRD/2026/01/04/..."), on the theory
+    that sentinel-s1-l1c's object keys were zero-padded even when STAC
+    returned an unpadded href. Verified directly against the bucket
+    (2026-09-28): the RAW, UNPADDED href STAC returns is the one that
+    actually exists (HTTP 200); the zero-padded guess 404s. The bucket's
+    real production failures were an IAM permission gap on the Batch task
+    role (no s3:GetObject on sentinel-s1-l1c), not a path-format mismatch
+    — that padding "fix" was chasing the wrong cause. Kept as a
+    single-candidate list (rather than inlining) so a genuine future
+    variant can still be added here without touching call sites.
+    """
+    return [asset_href]
 
 
 def _format_reason_counts(reason_counts: Dict[str, int]) -> str:

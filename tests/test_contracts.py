@@ -235,12 +235,19 @@ class TestStacSampling:
         assert all(it in items for it in sampled)
 
 
-# ── Downstream chaining: no duplicate webhook/Stage-5 fires, no weak secret ────
+# ── Downstream chaining: no duplicate webhook fires, no weak secret ────────────
+#
+# _trigger_downstream() only reports planting_date=completed to Django now.
+# It does NOT invoke a Stage 5 lambda directly — that call used to target
+# "nuru-start-crop-health-pipeline", which has never existed as a deployed
+# function (confirmed via `aws lambda get-function`). Stage 4→5 chaining
+# happens independently via an EventBridge rule watching this job's AWS
+# Batch job-state change, which invokes nuru-pipeline-chain-coordinator —
+# confirmed live and unrelated to anything in this script.
 
 class TestTriggerDownstream:
     @mock.patch("urllib.request.urlopen")
-    @mock.patch("boto3.client")
-    def test_skips_on_batch_retry_attempt(self, mock_boto_client, mock_urlopen, monkeypatch):
+    def test_skips_on_batch_retry_attempt(self, mock_urlopen, monkeypatch):
         monkeypatch.setenv("AWS_BATCH_JOB_ATTEMPT", "2")
         monkeypatch.setenv("UPLOAD_ID", "abc123")
         monkeypatch.setenv("GPS_RESULT_WEBHOOK_SECRET", "real-secret")
@@ -248,41 +255,34 @@ class TestTriggerDownstream:
         _trigger_downstream(dry_run=False)
 
         mock_urlopen.assert_not_called()
-        mock_boto_client.assert_not_called()
 
     @mock.patch("urllib.request.urlopen")
-    @mock.patch("boto3.client")
     def test_skips_webhook_without_secret_but_does_not_use_a_hardcoded_default(
-        self, mock_boto_client, mock_urlopen, monkeypatch
+        self, mock_urlopen, monkeypatch
     ):
         monkeypatch.delenv("AWS_BATCH_JOB_ATTEMPT", raising=False)
         monkeypatch.setenv("UPLOAD_ID", "abc123")
         monkeypatch.delenv("GPS_RESULT_WEBHOOK_SECRET", raising=False)
-        mock_boto_client.return_value.invoke.return_value = {}
 
         _trigger_downstream(dry_run=False)
 
         mock_urlopen.assert_not_called()  # never falls back to a known/committed secret
 
     @mock.patch("urllib.request.urlopen")
-    @mock.patch("boto3.client")
-    def test_fires_both_on_first_attempt_with_secret_set(
-        self, mock_boto_client, mock_urlopen, monkeypatch
+    def test_fires_webhook_on_first_attempt_with_secret_set(
+        self, mock_urlopen, monkeypatch
     ):
         monkeypatch.setenv("AWS_BATCH_JOB_ATTEMPT", "1")
         monkeypatch.setenv("UPLOAD_ID", "abc123")
         monkeypatch.setenv("GPS_RESULT_WEBHOOK_SECRET", "real-secret")
         mock_urlopen.return_value.__enter__.return_value.status = 200
-        mock_boto_client.return_value.invoke.return_value = {}
 
         _trigger_downstream(dry_run=False)
 
         mock_urlopen.assert_called_once()
-        mock_boto_client.return_value.invoke.assert_called_once()
 
     @mock.patch("urllib.request.urlopen")
-    @mock.patch("boto3.client")
-    def test_dry_run_never_calls_either(self, mock_boto_client, mock_urlopen, monkeypatch):
+    def test_dry_run_never_calls_webhook(self, mock_urlopen, monkeypatch):
         monkeypatch.delenv("AWS_BATCH_JOB_ATTEMPT", raising=False)
         monkeypatch.setenv("UPLOAD_ID", "abc123")
         monkeypatch.setenv("GPS_RESULT_WEBHOOK_SECRET", "real-secret")
@@ -290,4 +290,3 @@ class TestTriggerDownstream:
         _trigger_downstream(dry_run=True)
 
         mock_urlopen.assert_not_called()
-        mock_boto_client.assert_not_called()
