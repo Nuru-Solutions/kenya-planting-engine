@@ -127,7 +127,7 @@ def run_batch_pipeline(
 
     try:
         # ── 2. Get eligible farms ───────────────────────────────────────────────
-        farms = dc.get_eligible_farms(batch_size=batch_size)
+        farms = dc.get_eligible_farms(season=season_str, year=year, batch_size=batch_size)
         if not farms:
             logger.info("✅ No eligible farms found. Pipeline complete.")
             return 0

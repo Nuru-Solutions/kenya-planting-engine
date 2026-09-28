@@ -61,13 +61,22 @@ SELECT
     f.area_ha                                       AS area_ha
 FROM   spatial.farms f
 JOIN   spatial.farm_intelligence fi ON f.uid = fi.farm_uuid
+-- Per-(farm, season, year) staleness, not farm_intelligence's single "last
+-- processed season" row -- otherwise a farm processed for Long Rains within
+-- the last 30 days looks "done" and gets skipped for Short Rains too, even
+-- though Short Rains has never been computed. See migrations/0001_create_
+-- farm_season_results.sql for the full story.
+LEFT JOIN spatial.farm_season_results fsr
+       ON  fsr.farm_uuid = fi.farm_uuid
+      AND  fsr.planting_season = %s
+      AND  fsr.planting_year   = %s
 WHERE  fi.crop_type IS NOT NULL
   AND  fi.crop_type != 'insufficient_data'
   AND  fi.tile_id IS NOT NULL
   AND  (
-      fi.planting_date IS NULL
-      OR fi.planting_processed_at IS NULL
-      OR fi.planting_processed_at < NOW() - INTERVAL '30 days'
+      fsr.planting_date IS NULL
+      OR fsr.planting_processed_at IS NULL
+      OR fsr.planting_processed_at < NOW() - INTERVAL '30 days'
   )
 ORDER  BY fi.tile_id, fi.farm_uuid
 LIMIT  %s
@@ -187,6 +196,55 @@ WHERE NOT EXISTS (
 )
 """
 
+# History counterpart to _UPSERT_PLANTING_SQL -- one row per (farm, season,
+# year) rather than one row per farm. Written in the same transaction (see
+# upsert_planting_results) so farm_intelligence's "current state" and this
+# table's history never disagree about what the last run found. Unlike
+# farm_intelligence's upsert, this always overwrites on conflict: each
+# (farm, season, year) triple is that season's result, full stop, so there's
+# no "existing good value" from a different season to protect here.
+_UPSERT_SEASON_RESULTS_SQL = """
+INSERT INTO spatial.farm_season_results (
+    farm_uuid,
+    county,
+    planting_season,
+    planting_year,
+    crop_season,
+    planting_date,
+    planting_confidence,
+    planting_confidence_level,
+    planting_method,
+    peak_ndvi,
+    peak_ndvi_date,
+    senescence_date,
+    season_length_days,
+    ndvi_integral,
+    ndvi_rise_rate,
+    total_rainfall_mm,
+    planting_processed_at,
+    updated_at
+)
+VALUES %s
+ON CONFLICT (farm_uuid, planting_season, planting_year) DO UPDATE SET
+    county                     = EXCLUDED.county,
+    crop_season                = EXCLUDED.crop_season,
+    planting_date              = EXCLUDED.planting_date,
+    planting_confidence        = EXCLUDED.planting_confidence,
+    planting_confidence_level  = EXCLUDED.planting_confidence_level,
+    planting_method            = EXCLUDED.planting_method,
+    peak_ndvi                  = EXCLUDED.peak_ndvi,
+    peak_ndvi_date             = EXCLUDED.peak_ndvi_date,
+    senescence_date            = EXCLUDED.senescence_date,
+    season_length_days         = EXCLUDED.season_length_days,
+    ndvi_integral               = EXCLUDED.ndvi_integral,
+    ndvi_rise_rate               = EXCLUDED.ndvi_rise_rate,
+    total_rainfall_mm            = EXCLUDED.total_rainfall_mm,
+    planting_processed_at        = EXCLUDED.planting_processed_at,
+    updated_at                    = EXCLUDED.updated_at
+    -- created_at intentionally omitted from SET -- set once on first
+    -- insert (DEFAULT NOW()), never touched again.
+"""
+
 
 class DatacubeClient:
     """
@@ -254,17 +312,21 @@ class DatacubeClient:
 
     # ── Farm selection ─────────────────────────────────────────────────────────
 
-    def get_eligible_farms(self, batch_size: int = 500) -> List[FarmRow]:
+    def get_eligible_farms(self, season: str, year: int, batch_size: int = 500) -> List[FarmRow]:
         """
-        SELECT farms where crop_type is resolved but planting_date is missing/stale.
+        SELECT farms where crop_type is resolved but planting_date is missing/
+        stale for the given (season, year) specifically.
         Returns FarmRow objects pre-sorted by tile_id (for tile-group processing).
         """
         conn = self._conn()
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(_ELIGIBLE_FARMS_SQL, (batch_size,))
+                cur.execute(_ELIGIBLE_FARMS_SQL, (season, year, batch_size))
                 rows = cur.fetchall()
-            logger.info("Found %d eligible farms for planting date detection", len(rows))
+            logger.info(
+                "Found %d eligible farms for planting date detection (%s %d)",
+                len(rows), season, year,
+            )
             return [FarmRow(**dict(r)) for r in rows]
         finally:
             self._release(conn)
@@ -403,10 +465,12 @@ class DatacubeClient:
 
         from datetime import datetime as dt
         rows = []
+        season_rows = []
         for farm_uuid, sr in results:
             n = sr.ndvi_signal
             r = sr.rainfall_signal
             now_utc = dt.utcnow()
+            crop_season = f"{sr.year}_{sr.season}"
             rows.append((
                 farm_uuid,
                 sr.estimated_planting_date,       # planting_date
@@ -424,6 +488,26 @@ class DatacubeClient:
                 r.total_seasonal_rainfall_mm,      # total_rainfall_mm
                 now_utc,                           # planting_processed_at
                 now_utc,                           # updated_at
+            ))
+            season_rows.append((
+                farm_uuid,
+                sr.county,                         # county (FK into spatial.farms(uid, county))
+                sr.season,                         # planting_season
+                sr.year,                           # planting_year
+                crop_season,                       # crop_season
+                sr.estimated_planting_date,        # planting_date
+                sr.confidence,                      # planting_confidence
+                sr.confidence_level,                 # planting_confidence_level
+                sr.method_used,                       # planting_method
+                n.peak_ndvi,                           # peak_ndvi
+                n.peak_date,                             # peak_ndvi_date
+                n.senescence_date,                        # senescence_date
+                n.season_length_days,                      # season_length_days
+                n.ndvi_integral,                            # ndvi_integral
+                n.ndvi_rise_rate,                            # ndvi_rise_rate
+                r.total_seasonal_rainfall_mm,                 # total_rainfall_mm
+                now_utc,                                       # planting_processed_at
+                now_utc,                                       # updated_at
             ))
 
         if dry_run:
@@ -444,8 +528,23 @@ class DatacubeClient:
                     ),
                     page_size=500,
                 )
+                psycopg2.extras.execute_values(
+                    cur,
+                    _UPSERT_SEASON_RESULTS_SQL,
+                    season_rows,
+                    template=(
+                        "(%s::uuid, %s, %s, %s::smallint, %s, %s::date, %s::float, %s, %s, "
+                        "%s::float, %s::date, %s::date, %s::smallint, %s::float, %s::float, "
+                        "%s::float, %s::timestamptz, %s::timestamptz)"
+                    ),
+                    page_size=500,
+                )
             conn.commit()
-            logger.info("Upserted %d planting results into spatial.farm_intelligence", len(rows))
+            logger.info(
+                "Upserted %d planting results into spatial.farm_intelligence "
+                "and spatial.farm_season_results",
+                len(rows),
+            )
             return len(rows)
         except Exception as exc:
             conn.rollback()

@@ -487,7 +487,15 @@ Examples:
 
         dc = DatacubeClient()
         limit = args.limit or 10000
-        farms = dc.get_eligible_farms(batch_size=limit)
+        # get_eligible_farms is now per-(season, year) -- this script loops
+        # over all_runs (every season/year combo) further down regardless,
+        # so this is just a broad initial candidate pool keyed off the first
+        # run; --polygon-ids (below) is the usual way this script is actually
+        # scoped for a manual backfill.
+        first_run = all_runs[0]
+        farms = dc.get_eligible_farms(
+            season=first_run["season"], year=first_run["year"], batch_size=limit,
+        )
         if args.polygon_ids:
             farms = [f for f in farms if f.farm_uuid in args.polygon_ids]
 
