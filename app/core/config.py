@@ -154,26 +154,55 @@ DEFAULT_AEZ = AEZConfig(
 
 
 # ── AEZ string code → numeric registry key ────────────────────────────────────
-# DB stores text codes like "LH 3", "UH 2"; GeoJSON stores numeric like 33.0.
-# This mapper bridges both. Coverage follows Kenya AEZ classification.
-# LH = Lower Highlands, UH = Upper Highlands, UM = Upper Midland, LM = Lower Midland
+# DB stores text codes like "LH 3", "UH 2"; GeoJSON stores full codes including
+# range/transition zones like "LH 2 - 3", "UM 2 - 4", and edge zones like "LH 0".
+# Some older farms were enriched with long-form zone-type names (e.g. "Lower
+# Highland") before zone_code standardisation — those are aliased here too.
+# LH = Lower Highland, UH = Upper Highland, UM = Upper Midland, LM = Lower Midland
+# IL = Inner Lowland, CL = Coastal Lowland, TA = Tropical Alpine
 _AEZ_TEXT_TO_CODE: dict[str, float] = {
-    # Upper & Lower Highlands → Highland config (99.0)
-    "UH 1": 99.0, "UH 2": 99.0, "UH 3": 99.0,
-    "LH 1": 99.0, "LH 2": 99.0, "LH 3": 99.0,
-    "LH 4": 99.0, "LH 5": 99.0,
-    # Upper Midland 1-3 → UM3 config (33.0)
+    # ── Upper Highland (UH) → Highland config (99.0) ───────────────────────
+    "UH 0": 99.0,
+    "UH 1": 99.0, "UH 2": 99.0, "UH 3": 99.0, "UH 4": 99.0,
+    "UH 1 - 2": 99.0, "UH 2 - 3": 99.0,
+    # ── Lower Highland (LH) → Highland config (99.0) ───────────────────────
+    "LH 0": 99.0,
+    "LH 1": 99.0, "LH 2": 99.0, "LH 3": 99.0, "LH 4": 99.0, "LH 5": 99.0,
+    "LH 2 - 3": 99.0, "LH 3 - 4": 99.0, "LH 4 - 5": 99.0,
+    "UH - LH 3": 99.0,
+    # ── Upper Midland 1-3 → UM3 config (33.0) ─────────────────────────────
+    "UM 0": 33.0,
     "UM 1": 33.0, "UM 2": 33.0, "UM 3": 33.0,
-    # Upper Midland 4-6 → semi-arid configs
+    "UM 1 - 2": 33.0, "UM 2 - 3": 33.0,
+    # ── Upper Midland 4-6 → semi-arid configs (44.0 / 46.0) ───────────────
     "UM 4": 44.0, "UM 5": 44.0, "UM 6": 46.0,
-    # Lower Midland → LM configs
+    "UM 3 - 4": 44.0, "UM 4 - 5": 44.0, "UM 5 - 6": 46.0,
+    "UM 2 - 4": 33.0,   # broad transition — map to UM3 (upper end)
+    # ── Lower Midland (LM) → 44.0 / 46.0 ─────────────────────────────────
     "LM 1": 44.0, "LM 2": 44.0, "LM 3": 44.0,
-    "LM 4": 46.0, "LM 5": 46.0,
-    # Inland / Coastal Lowlands → semi-arid
+    "LM 4": 46.0, "LM 5": 46.0, "LM 6": 46.0, "LM 7": 46.0,
+    "LM 4 - 5": 46.0, "LM 5 - 6": 46.0,
+    # ── Inner Lowland (IL) → semi-arid (46.0) ─────────────────────────────
     "IL 1": 46.0, "IL 2": 46.0, "IL 3": 46.0,
-    "IL 4": 46.0, "IL 5": 46.0, "IL 6": 46.0,
+    "IL 4": 46.0, "IL 5": 46.0, "IL 6": 46.0, "IL 7": 46.0,
+    # ── Coastal Lowland (CL) → semi-arid (46.0) ───────────────────────────
     "CL 1": 46.0, "CL 2": 46.0, "CL 3": 46.0,
-    "CL 4": 46.0, "CL 5": 46.0,
+    "CL 4": 46.0, "CL 5": 46.0, "CL 6": 46.0,
+    "CL 2 (-3)": 46.0, "CL 3 - 4": 46.0,
+    # ── Tropical Alpine (TA) → Highland config (99.0) ─────────────────────
+    "TA 0": 99.0, "TA 1": 99.0, "TA 2": 99.0,
+    "TA 1 - 2": 99.0,
+    # ── Nairobi / urban (NBO) → UM3 (best urban proxy) ────────────────────
+    "NBO": 33.0,
+    # ── Long-form zone-type aliases (older farms enriched pre-standardisation)
+    # These match aez_name values that were inadvertently written into aez_code.
+    "LOWER HIGHLAND": 99.0, "UPPER HIGHLAND": 99.0,
+    "UPPER MIDLAND": 33.0,
+    "LOWER MIDLAND": 44.0,
+    "INNER LOWLAND": 46.0,
+    "COASTAL LOWLAND": 46.0,
+    "TROPICAL ALPINE": 99.0,
+    "NAIROBI CITY": 33.0,
 }
 
 
