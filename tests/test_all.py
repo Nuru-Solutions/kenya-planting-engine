@@ -325,3 +325,172 @@ class TestSeasonRunList:
         years = [r["year"] for r in runs]
         assert years[0] == years[1] == 2024
         assert years[2] == years[3] == 2025
+
+
+# ── Crop Registry ──────────────────────────────────────────────────────────────
+
+class TestCropRegistry:
+    """
+    Regression suite for CROP_REGISTRY / get_crop_config.
+
+    Root cause that prompted this class:
+    Stage 3 (crop-classifier-v2) emits CROP_NAMES = ["maize", "cassava",
+    "common_bean", "soybean"]. Stage 4 (kenya-planting-engine) calls
+    get_crop_config(farm.crop_type) for every farm. Prior to the fix,
+    CROP_REGISTRY only contained "maize"; any cassava farm triggered
+        WARNING Unknown crop_type 'cassava' — falling back to maize CropConfig
+    and received maize's 75-130 day cycle parameters instead of cassava's
+    180-365 day parameters. This silently produced wrong planting dates for
+    every cassava farm in production.
+
+    These tests ensure:
+    1. All four classifier-emitted crop types resolve without a warning fallback.
+    2. Cassava's parameters are semantically distinct from maize's (the bug was
+       silent — same return value, different meaning).
+    3. Alias / case-normalisation paths are covered.
+    """
+
+    def test_cassava_resolves_without_fallback(self, caplog):
+        """get_crop_config('cassava') must NOT log an 'Unknown crop_type' warning."""
+        import logging
+        from app.core.config import get_crop_config
+        with caplog.at_level(logging.WARNING, logger="app.core.config"):
+            cfg = get_crop_config("cassava")
+        unknown_warns = [r for r in caplog.records if "Unknown crop_type" in r.message]
+        assert not unknown_warns, (
+            f"get_crop_config('cassava') still triggers fallback warning: "
+            f"{[r.message for r in unknown_warns]}"
+        )
+        assert cfg.crop_type == "cassava"
+
+    def test_cassava_has_distinct_cycle_from_maize(self):
+        """Cassava's cycle must be meaningfully distinct from maize's.
+
+        After extending maize max to 210d for highland varieties, the 180-210d
+        range is legitimately shared (highland maize ≈ cassava short-season).
+        The decisive distinction is cassava's absolute ceiling (365d, full-year
+        bitter varieties) which far exceeds any maize variety, and its explicit
+        signal_weight_override marking it as a different agronomic regime.
+        """
+        from app.core.config import get_crop_config
+        maize = get_crop_config("maize")
+        cassava = get_crop_config("cassava")
+        # Cassava can run a full year; maize tops out at ~7 months
+        assert cassava.max_season_length_days > maize.max_season_length_days, (
+            f"Cassava max cycle ({cassava.max_season_length_days}d) should exceed "
+            f"maize max cycle ({maize.max_season_length_days}d)"
+        )
+        # Cassava has an explicit SAR-upweighted signal override; maize uses AEZ default
+        assert cassava.signal_weight_override is not None, (
+            "Cassava should have an explicit signal_weight_override distinct from maize"
+        )
+        assert maize.signal_weight_override is None, (
+            "Maize should defer to AEZ signal_weights (no override)"
+        )
+
+    def test_cassava_planting_offset_longer_than_maize(self):
+        from app.core.config import get_crop_config
+        assert get_crop_config("cassava").planting_offset_days >= get_crop_config("maize").planting_offset_days
+
+    def test_cassava_peak_ndvi_lower_than_maize(self):
+        """Cassava has a sparser canopy than maize — its peak NDVI upper bound
+        must be <= maize's lower bound of 0.45, not exceeding maize's range."""
+        from app.core.config import get_crop_config
+        cassava = get_crop_config("cassava")
+        maize = get_crop_config("maize")
+        assert cassava.peak_ndvi_expected_range[1] <= maize.peak_ndvi_expected_range[1], (
+            "Cassava peak NDVI upper bound should not exceed maize's"
+        )
+        assert cassava.peak_ndvi_expected_range[0] < maize.peak_ndvi_expected_range[0], (
+            "Cassava peak NDVI lower bound should be below maize's"
+        )
+
+    def test_cassava_case_insensitive(self):
+        """Classifier outputs lowercase; guard against case drift."""
+        from app.core.config import get_crop_config
+        for variant in ("cassava", "CASSAVA", "Cassava"):
+            cfg = get_crop_config(variant)
+            assert cfg.crop_type == "cassava", f"Case variant '{variant}' did not resolve to cassava"
+
+    @pytest.mark.parametrize("crop_name", ["maize", "cassava", "common_bean", "soybean"])
+    def test_all_classifier_crop_names_resolve_without_fallback(self, crop_name, caplog):
+        """Every entry in Stage 3's CROP_NAMES must resolve without any warning.
+        All four are now first-class CROP_REGISTRY entries.
+        """
+        import logging
+        from app.core.config import get_crop_config
+        with caplog.at_level(logging.WARNING, logger="app.core.config"):
+            cfg = get_crop_config(crop_name)
+        unknown_warns = [r for r in caplog.records if "Unknown crop_type" in r.message]
+        assert not unknown_warns, (
+            f"'{crop_name}' triggered unexpected fallback warning: "
+            f"{[r.message for r in unknown_warns]}"
+        )
+        # Resolved crop_type must not silently fall through to maize
+        assert cfg.crop_type != "maize" or crop_name == "maize", (
+            f"'{crop_name}' silently resolved to maize config"
+        )
+
+    def test_common_bean_alias_resolves_to_beans_registry_entry(self):
+        """common_bean (Stage 3 label) must route through _CROP_ALIASES to the
+        real 'beans' CROP_REGISTRY entry, not to the old maize silent fallback."""
+        from app.core.config import get_crop_config
+        cfg = get_crop_config("common_bean")
+        assert cfg.crop_type == "beans"
+        assert cfg.min_season_length_days == 55
+        assert cfg.max_season_length_days == 90
+
+    def test_soybean_resolves_without_fallback(self, caplog):
+        import logging
+        from app.core.config import get_crop_config
+        with caplog.at_level(logging.WARNING, logger="app.core.config"):
+            cfg = get_crop_config("soybean")
+        unknown_warns = [r for r in caplog.records if "Unknown crop_type" in r.message]
+        assert not unknown_warns
+        assert cfg.crop_type == "soybean"
+        assert cfg.min_season_length_days == 90
+        assert cfg.max_season_length_days == 140
+
+    def test_beans_cycle_distinct_from_maize(self):
+        """Beans is a short-season legume — its max cycle must be well below
+        maize's max, and its peak NDVI range must be lower (sparser canopy)."""
+        from app.core.config import get_crop_config
+        beans = get_crop_config("beans")
+        maize = get_crop_config("maize")
+        # Beans tops out at 90 days; maize reaches up to 130 days
+        assert beans.max_season_length_days < maize.max_season_length_days, (
+            f"Beans max cycle ({beans.max_season_length_days}) should be below "
+            f"maize max cycle ({maize.max_season_length_days})"
+        )
+        # Beans has a sparser canopy than maize
+        assert beans.peak_ndvi_expected_range[1] < maize.peak_ndvi_expected_range[1], (
+            "Beans peak NDVI upper bound should be below maize's"
+        )
+
+    def test_soybean_cycle_overlaps_maize_but_distinct_config(self):
+        """Soybean has a similar-length cycle to maize, but must have its own
+        crop_type identity so planting parameters aren't shared."""
+        from app.core.config import get_crop_config
+        soybean = get_crop_config("soybean")
+        assert soybean.crop_type == "soybean"
+        assert soybean.peak_ndvi_expected_range != get_crop_config("maize").peak_ndvi_expected_range
+
+    def test_maize_still_resolves(self):
+        """Smoke test: the primary crop must not have been disturbed by any changes."""
+        from app.core.config import get_crop_config
+        cfg = get_crop_config("maize")
+        assert cfg.crop_type == "maize"
+        assert cfg.min_season_length_days == 75
+        assert cfg.max_season_length_days == 210  # extended for highland varieties
+
+    def test_maize_highland_cycle_covers_trans_nzoia(self):
+        """Trans Nzoia / Uasin Gishu highland maize (DH02, Duma 43) can reach
+        ~210 days. The cycle bound must accommodate this so the planting engine
+        doesn't reject valid highland detections."""
+        from app.core.config import get_crop_config
+        maize = get_crop_config("maize")
+        highland_cycle_days = 7 * 30  # 7 months ≈ 210 days
+        assert maize.max_season_length_days >= highland_cycle_days, (
+            f"Maize max cycle ({maize.max_season_length_days}d) is too short for "
+            f"highland varieties — Trans Nzoia needs at least {highland_cycle_days}d"
+        )

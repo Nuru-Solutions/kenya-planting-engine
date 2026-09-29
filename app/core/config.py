@@ -271,10 +271,58 @@ CROP_REGISTRY: dict[str, CropConfig] = {
         crop_type="maize",
         planting_offset_days=12,
         min_season_length_days=75,
-        max_season_length_days=130,
+        max_season_length_days=210,   # 75-105d: lowland/short-season (H614D LM);
+                                      # 105-130d: mid-altitude (H625, PH4 UM);
+                                      # 150-210d: highland (DH02, Duma 43 LH/UH —
+                                      #   Trans Nzoia, Uasin Gishu, Elgeyo Marakwet).
+                                      # Cool temperatures at >1800m slow heat unit
+                                      # accumulation, pushing long-season varieties
+                                      # toward 7 months. AEZ signal_weights already
+                                      # differentiate zones (highland: NDVI 0.45,
+                                      # SAR 0.30); the cycle bound must span all.
         signal_weight_override=None,
         peak_ndvi_expected_range=(0.45, 0.85),
-        notes="Primary crop. Bimodal LR + SR. NDVI-dominant in highlands.",
+        notes="Primary crop. Bimodal LR + SR. NDVI-dominant in highlands. "
+              "Cycle: 75d (lowland) → 210d (Trans Nzoia/Uasin Gishu highland).",
+    ),
+    # ── Cassava — Stage 3 classifier emits this crop_type (thresholds.json
+    # confirms cassava: 0.45). Longer cycle, slower canopy closure, lower NDVI
+    # peak vs maize. SAR slightly upweighted: cassava fields often retain more
+    # soil moisture signal. Primarily LM / coastal / humid zones in Kenya.
+    "cassava": CropConfig(
+        crop_type="cassava",
+        planting_offset_days=14,          # slower establishment than maize
+        min_season_length_days=180,        # shortest viable semi-sweet cycle
+        max_season_length_days=365,        # bitter varieties can run a full yr
+        signal_weight_override=(0.35, 0.35, 0.30),  # mild SAR upweight
+        peak_ndvi_expected_range=(0.30, 0.75),       # lower canopy than maize
+        notes="Stage 3 classifier output. Long-cycle root crop. "
+              "LM4-6 / coastal zones. Unimodal or year-round.",
+    ),
+    # ── Beans (common_bean) — Stage 3 classifier emits "common_bean";
+    # _CROP_ALIASES normalises that to "beans" before the registry lookup.
+    # Short-season legume: rapid canopy close, lower peak NDVI than maize.
+    "beans": CropConfig(
+        crop_type="beans",
+        planting_offset_days=8,
+        min_season_length_days=55,
+        max_season_length_days=90,
+        signal_weight_override=None,
+        peak_ndvi_expected_range=(0.30, 0.65),
+        notes="Stage 3 classifier output (common_bean). Short-season legume. "
+              "Bimodal LR + SR. Rainfall signal most reliable.",
+    ),
+    # ── Soybean — Stage 3 classifier emits "soybean". Medium-cycle oilseed;
+    # canopy denser than beans, lighter than maize. Grown mainly in LM zones.
+    "soybean": CropConfig(
+        crop_type="soybean",
+        planting_offset_days=10,
+        min_season_length_days=90,
+        max_season_length_days=140,
+        signal_weight_override=(0.38, 0.37, 0.25),
+        peak_ndvi_expected_range=(0.35, 0.75),
+        notes="Stage 3 classifier output. Medium-cycle oilseed. LM zones. "
+              "NDVI and rainfall weighted near-equally.",
     ),
     # ── Future crops — uncomment + tune when Stage 3 classifier supports them ──
     # "wheat": CropConfig(
@@ -286,10 +334,6 @@ CROP_REGISTRY: dict[str, CropConfig] = {
     #     max_season_length_days=160, signal_weight_override=(0.40, 0.35, 0.25),
     #     peak_ndvi_expected_range=(0.30, 0.70),
     #     notes="SAR more reliable in semi-arid zones.",
-    # ),
-    # "beans": CropConfig(
-    #     "beans", planting_offset_days=8, min_season_length_days=55,
-    #     max_season_length_days=90, peak_ndvi_expected_range=(0.30, 0.65),
     # ),
     # "potato": CropConfig(
     #     "potato", planting_offset_days=7, min_season_length_days=80,
@@ -303,6 +347,14 @@ CROP_REGISTRY: dict[str, CropConfig] = {
 }
 
 _CROP_ALIASES: dict[str, str] = {
+    # cassava variants
+    "cassava": "cassava",
+    # soybean variants
+    "soybean": "soybean",
+    "soya": "soybean",
+    "soya_bean": "soybean",
+    "soya bean": "soybean",
+    # common_bean / beans variants — all resolve to "beans" in CROP_REGISTRY
     "common_bean": "beans",
     "common bean": "beans",
     "common-bean": "beans",
@@ -314,8 +366,10 @@ _CROP_ALIASES: dict[str, str] = {
 }
 
 _FALLBACK_CROP_BY_ALIAS: dict[str, CropConfig] = {
-    # Until beans is fully enabled in CROP_REGISTRY, use maize defaults without warning spam.
-    "beans": CROP_REGISTRY["maize"],
+    # All Stage 3 classifier outputs now have first-class CROP_REGISTRY entries.
+    # This dict is kept for forward-compatibility: add entries here only for crops
+    # that are in _CROP_ALIASES but not yet in CROP_REGISTRY (e.g. a new label
+    # added to Stage 3 before its planting parameters are tuned).
 }
 
 
