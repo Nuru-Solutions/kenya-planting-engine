@@ -6,7 +6,9 @@ Stage 4: Planting Date Engine — AWS Batch Production Entrypoint
 Architecture (mirrors Stage 3 run_crop_classifier.py structure):
 ----------------------------------------------------------------
   1. Connect to PostGIS / TimescaleDB (DatacubeClient)
-  2. SELECT eligible farms (crop_type set, planting_date NULL/stale)
+  2. SELECT eligible farms (crop_type set, planting_date NULL/stale), in
+     batches, triggering upload first, then never-attempted, then oldest
+     attempt — looping until every eligible farm has been attempted
   3. Group farms by tile_id  [same pattern as Stage 3]
   4. For each tile group:
        a. Sentinel2STACFetcher.fetch_for_tile()  → cache to farm_indices
@@ -17,6 +19,8 @@ Architecture (mirrors Stage 3 run_crop_classifier.py structure):
                └─ reads NDVI/SAR from farm_indices cache
                └─ fetches climate from Visual Crossing → climate_daily cache
        d. Bulk upsert SeasonResults → spatial.farm_intelligence
+       e. Record an attempt (no_signal / empty / error) for every farm
+          without a detection, so it rotates to the back of the queue
   5. Log summary  +  exit code 0/1 for Batch retry logic
 
 AWS Batch trigger
@@ -28,7 +32,9 @@ AWS Batch trigger
 CLI
 ---
   python scripts/run_datacube_batch.py
-      [--batch-size  500]       # farms per run (default 500)
+      [--batch-size  500]       # farms per batch; loops until all eligible farms are attempted
+      [--retry-cooldown-hours 24]  # skip farms attempted within N hours (new farms always run)
+      [--max-farms   0]         # optional per-run cap (0 = none)
       [--season      long_rains] # long_rains | short_rains | third_season
       [--year        2025]       # crop calendar year
       [--workers     4]          # ThreadPoolExecutor workers (bounded by DB pool)
@@ -42,7 +48,8 @@ import logging
 import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
+from datetime import date, timedelta
+import os
 
 from app.core.config import get_aez_config, Season, get_settings
 from app.core.models import FarmRow, SeasonResult
@@ -262,6 +269,35 @@ def _persistable_results(
     return ok_results, n_skipped, n_clim_only
 
 
+def _attempt_outcomes(
+    tile_farm_uuids: list[str],
+    tile_results: list[tuple[str, SeasonResult]],
+    ok_results: list[tuple[str, SeasonResult]],
+) -> list[tuple[str, str]]:
+    """
+    (farm_uuid, outcome) for every farm in the tile that did NOT produce a
+    persisted detection. Persisted detections record their own attempt via
+    upsert_planting_results. Farms whose worker raised have no entry in
+    tile_results and are reported as "error" — every farm handed to the tile
+    gets exactly one outcome, so none can silently fall out of the rotation.
+    """
+    persisted = {fuid for fuid, _ in ok_results}
+    by_uuid = dict(tile_results)
+    outcomes = []
+    for fuid in tile_farm_uuids:
+        if fuid in persisted:
+            continue
+        r = by_uuid.get(fuid)
+        if r is None or r.error:
+            outcome = "error"
+        elif r.method_used == "fallback_climatology":
+            outcome = "no_signal"
+        else:
+            outcome = "empty"
+        outcomes.append((fuid, outcome))
+    return outcomes
+
+
 # ── Per-farm worker ────────────────────────────────────────────────────────────
 
 def _process_farm(
@@ -297,110 +333,174 @@ def run_batch_pipeline(
     year: int,
     workers: int,
     dry_run: bool,
+    retry_cooldown_hours: float = 24.0,
+    max_farms: int = 0,
 ) -> int:
     """
-    Execute the planting date detection batch.
+    Execute planting date detection for EVERY eligible farm, in batches of
+    `batch_size`, until none is left that hasn't been attempted in this run
+    (or within `retry_cooldown_hours`).
+
+    Previously a run processed one batch of 500 and stopped; farms with no
+    usable signal were never recorded as tried, so the same 500 were picked
+    every run and every farm sorting after them was never processed.
+
     Returns exit code: 0 = success, 1 = partial failures.
     """
     logger.info("=" * 65)
     logger.info("🌱  STAGE 4: Planting Date Engine — Datacube Batch")
-    logger.info("   Season     : %s %d", season_str, year)
-    logger.info("   Batch size : %d farms", batch_size)
-    logger.info("   Workers    : %d threads", workers)
-    logger.info("   Dry run    : %s", dry_run)
+    logger.info("   Season       : %s %d", season_str, year)
+    logger.info("   Batch size   : %d farms", batch_size)
+    logger.info("   Retry after  : %.1f h", retry_cooldown_hours)
+    logger.info("   Max farms    : %s", max_farms or "no limit")
+    logger.info("   Workers      : %d threads", workers)
+    logger.info("   Dry run      : %s", dry_run)
     logger.info("=" * 65)
 
     # ── 1. Connect ─────────────────────────────────────────────────────────────
     dc = DatacubeClient()
+    priority_upload_id = os.environ.get("UPLOAD_ID") or None
 
     try:
-        # ── 2. Get eligible farms ───────────────────────────────────────────────
-        farms = dc.get_eligible_farms(season=season_str, year=year, batch_size=batch_size)
-        if not farms:
-            logger.info("✅ No eligible farms found. Pipeline complete.")
-            # Still chain forward — a CSV-upload run with zero eligible farms
-            # (e.g. crop classifier found nothing plantable) must not leave
-            # its upload_id stuck "in progress" on the Django side forever.
-            _trigger_downstream(dry_run)
-            return 0
+        # DB clock, so the cut-off compares like with like (see get_db_now).
+        run_started_at = dc.get_db_now()
+        retry_before = run_started_at - timedelta(hours=max(retry_cooldown_hours, 0.0))
 
-        # ── 3. Group by tile_id (mirrors Stage 3) ──────────────────────────────
-        tile_groups: dict[str, list[FarmRow]] = defaultdict(list)
-        for farm in farms:
-            tile_groups[farm.tile_id].append(farm)
-
-        logger.info("Grouped %d farms into %d Sentinel-2 tiles", len(farms), len(tile_groups))
-
-        # ── 4. Process tile-by-tile ─────────────────────────────────────────────
         total_succeeded = 0
         total_failed    = 0
+        total_selected  = 0
         method_counts: dict[str, int] = defaultdict(int)
+        outcome_counts: dict[str, int] = defaultdict(int)
         confidence_sum  = 0.0
-        all_upsert_rows: list[tuple] = []
+        seen: set[str]  = set()
+        batch_no        = 0
 
-        for tile_idx, (tile_id, tile_farms) in enumerate(tile_groups.items(), start=1):
-            n = len(tile_farms)
-            logger.info("[%d/%d] Tile %s — %d farms", tile_idx, len(tile_groups), tile_id, n)
+        while True:
+            remaining = (max_farms - total_selected) if max_farms else batch_size
+            if remaining <= 0:
+                logger.info("Reached --max-farms=%d — stopping; the rest will be picked up next run.", max_farms)
+                break
 
-            # ── 4a. Pre-fetch STAC data for this tile → writes to farm_indices ──
-            # Fetch the UNION of all distinct AEZ windows present in this
-            # tile (see _tile_fetch_window docstring) so every farm's window
-            # is fully covered by the shared cache, not just farm[0]'s.
-            tile_pairs = [(f.farm_uuid, f.geom_wkt) for f in tile_farms]
-            fetch_start, win_end = _tile_fetch_window(tile_farms, season_str, year)
+            # ── 2. Next batch of eligible farms ────────────────────────────────
+            farms = dc.get_eligible_farms(
+                season=season_str,
+                year=year,
+                batch_size=min(batch_size, remaining),
+                retry_before=retry_before,
+                priority_upload_id=priority_upload_id,
+            )
+            farms = [f for f in farms if f.farm_uuid not in seen]
+            if not farms:
+                if batch_no == 0:
+                    logger.info("✅ No eligible farms found.")
+                break
+            # Safety net: attempts are recorded for every selected farm, so a
+            # farm should never come back within one run. If one does (e.g.
+            # dry run, or attempt recording failed), the filter above drops it
+            # and this loop ends instead of spinning forever.
+            batch_no += 1
+            seen.update(f.farm_uuid for f in farms)
+            total_selected += len(farms)
+            logger.info("── Batch %d: %d farms (%d selected so far this run)", batch_no, len(farms), total_selected)
 
-            # Sentinel-2 NDVI/EVI/NDWI
-            conn_s2 = dc._pool.getconn()
-            try:
-                s2 = Sentinel2STACFetcher(conn_s2)
-                s2.fetch_for_tile(tile_id, tile_pairs, fetch_start, win_end)
-            finally:
-                dc._pool.putconn(conn_s2)
+            # ── 3. Group by tile_id (mirrors Stage 3) ──────────────────────────
+            tile_groups: dict[str, list[FarmRow]] = defaultdict(list)
+            for farm in farms:
+                tile_groups[farm.tile_id].append(farm)
+            logger.info("Grouped %d farms into %d Sentinel-2 tiles", len(farms), len(tile_groups))
 
-            # Sentinel-1 SAR VV/VH/cross_pol
-            conn_s1 = dc._pool.getconn()
-            try:
-                s1 = Sentinel1STACFetcher(conn_s1)
-                s1.fetch_for_tile(tile_id, tile_pairs, fetch_start, win_end)
-            finally:
-                dc._pool.putconn(conn_s1)
+            # ── 4. Process tile-by-tile ─────────────────────────────────────────
+            for tile_idx, (tile_id, tile_farms) in enumerate(tile_groups.items(), start=1):
+                n = len(tile_farms)
+                logger.info("[%d/%d] Tile %s — %d farms", tile_idx, len(tile_groups), tile_id, n)
+                tile_farm_uuids = [f.farm_uuid for f in tile_farms]
+                tile_results: list[tuple[str, SeasonResult]] = []
+                ok_results: list[tuple[str, SeasonResult]] = []
 
-            # ── 4b. Detect planting date per farm (threaded) ────────────────────
-            tile_results: list[tuple[str, SeasonResult]] = []
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {
-                    pool.submit(_process_farm, farm, season_str, year, dc): farm.farm_uuid
-                    for farm in tile_farms
-                }
-                for future in as_completed(futures):
-                    farm_uuid = futures[future]
+                try:
+                    # ── 4a. Pre-fetch STAC data for this tile → farm_indices ──
+                    # Fetch the UNION of all distinct AEZ windows present in this
+                    # tile (see _tile_fetch_window docstring) so every farm's
+                    # window is fully covered by the shared cache.
+                    tile_pairs = [(f.farm_uuid, f.geom_wkt) for f in tile_farms]
+                    fetch_start, win_end = _tile_fetch_window(tile_farms, season_str, year)
+
+                    # Sentinel-2 NDVI/EVI/NDWI
+                    conn_s2 = dc._pool.getconn()
                     try:
-                        fuid, result = future.result()
-                        tile_results.append((fuid, result))
-                        if result.error:
-                            total_failed += 1
-                            logger.warning("Farm %s failed: %s", fuid[:8], result.error)
-                        else:
-                            total_succeeded += 1
-                            method_counts[result.method_used] += 1
-                            confidence_sum += result.confidence
-                    except Exception as exc:
-                        total_failed += 1
-                        logger.error("Farm %s raised: %s", farm_uuid[:8], exc)
+                        s2 = Sentinel2STACFetcher(conn_s2)
+                        s2.fetch_for_tile(tile_id, tile_pairs, fetch_start, win_end)
+                    finally:
+                        dc._pool.putconn(conn_s2)
 
-            # ── 4c. Bulk upsert results for this tile ───────────────────────────
-            # See _persistable_results() docstring: excludes failures, empty
-            # detections, and pure calendar-fallback guesses.
-            ok_results, skipped, clim_only = _persistable_results(tile_results)
-            if skipped:
-                logger.info(
-                    "Skipping %d failed/empty/calendar-only detections (not written)"
-                    " — %d were pure calendar fallback (no real signal)",
-                    skipped, clim_only,
-                )
-            if ok_results:
-                dc.upsert_planting_results(ok_results, dry_run=dry_run)
-                all_upsert_rows.extend(ok_results)
+                    # Sentinel-1 SAR VV/VH/cross_pol
+                    conn_s1 = dc._pool.getconn()
+                    try:
+                        s1 = Sentinel1STACFetcher(conn_s1)
+                        s1.fetch_for_tile(tile_id, tile_pairs, fetch_start, win_end)
+                    finally:
+                        dc._pool.putconn(conn_s1)
+
+                    # ── 4b. Detect planting date per farm (threaded) ────────────
+                    with ThreadPoolExecutor(max_workers=workers) as pool:
+                        futures = {
+                            pool.submit(_process_farm, farm, season_str, year, dc): farm.farm_uuid
+                            for farm in tile_farms
+                        }
+                        for future in as_completed(futures):
+                            farm_uuid = futures[future]
+                            try:
+                                fuid, result = future.result()
+                                tile_results.append((fuid, result))
+                                if result.error:
+                                    total_failed += 1
+                                    logger.warning("Farm %s failed: %s", fuid[:8], result.error)
+                                else:
+                                    total_succeeded += 1
+                                    method_counts[result.method_used] += 1
+                                    confidence_sum += result.confidence
+                            except Exception as exc:
+                                total_failed += 1
+                                logger.error("Farm %s raised: %s", farm_uuid[:8], exc)
+
+                    # ── 4c. Bulk upsert real detections for this tile ───────────
+                    # See _persistable_results() docstring: excludes failures,
+                    # empty detections, and pure calendar-fallback guesses.
+                    ok_results, skipped, clim_only = _persistable_results(tile_results)
+                    if skipped:
+                        logger.info(
+                            "%d farm(s) without a real detection this time"
+                            " (%d pure calendar fallback) — recorded as attempted, will be retried",
+                            skipped, clim_only,
+                        )
+                    if ok_results:
+                        dc.upsert_planting_results(ok_results, dry_run=dry_run)
+                        outcome_counts["detected"] += len(ok_results)
+
+                except Exception as tile_exc:
+                    # A whole-tile failure (STAC outage, DB write error) must not
+                    # abort the run or leave these farms first in line forever.
+                    failed_now = n - len(tile_results)
+                    total_failed += failed_now
+                    logger.error("Tile %s failed (%d farms recorded as errored): %s",
+                                 tile_id, n, tile_exc, exc_info=True)
+                    ok_results = []
+                    tile_results = []
+
+                # ── 4d. Record an attempt for every farm without a detection ──
+                outcomes = _attempt_outcomes(tile_farm_uuids, tile_results, ok_results)
+                for _fuid, outcome in outcomes:
+                    outcome_counts[outcome] += 1
+                try:
+                    dc.record_attempts(outcomes, season=season_str, year=year, dry_run=dry_run)
+                except Exception:
+                    total_failed += 1  # logged in record_attempts; loop guard prevents re-selection
+
+            if dry_run:
+                # Dry runs record nothing, so eligibility can't advance past
+                # this batch; one batch is a representative sample.
+                logger.info("Dry run — stopping after one batch.")
+                break
 
         # ── 5. Summary ──────────────────────────────────────────────────────────
         total = total_succeeded + total_failed
@@ -415,6 +515,8 @@ def run_batch_pipeline(
                     100 * total_succeeded / max(total, 1))
         logger.info("   Failed           : %d", total_failed)
         logger.info("   Avg confidence   : %.3f", avg_conf)
+        logger.info("   Batches          : %d", batch_no)
+        logger.info("   Outcomes         : %s", dict(outcome_counts) or "{}")
         logger.info("   Methods used     :")
         for method, count in sorted(method_counts.items(), key=lambda x: -x[1]):
             logger.info("     %-30s : %d", method, count)
@@ -440,7 +542,17 @@ def main() -> None:
     )
     parser.add_argument(
         "--batch-size", type=int, default=500,
-        help="Max number of farms to process per run (default: 500)",
+        help="Farms fetched per batch; the run loops until every eligible farm is attempted (default: 500)",
+    )
+    parser.add_argument(
+        "--retry-cooldown-hours", type=float,
+        default=float(os.environ.get("PLANTING_RETRY_COOLDOWN_HOURS", "24")),
+        help="Don't retry a farm attempted within this many hours (default: 24, env PLANTING_RETRY_COOLDOWN_HOURS). "
+             "Never-attempted farms are always processed.",
+    )
+    parser.add_argument(
+        "--max-farms", type=int, default=int(os.environ.get("PLANTING_MAX_FARMS_PER_RUN", "0")),
+        help="Optional cap on farms per run; 0 = no cap (default). The rest are picked up next run, oldest attempt first.",
     )
     parser.add_argument(
         "--season", type=str, default=default_season,
@@ -484,6 +596,8 @@ def main() -> None:
         year        = args.year,
         workers     = args.workers,
         dry_run     = args.dry_run,
+        retry_cooldown_hours = args.retry_cooldown_hours,
+        max_farms   = args.max_farms,
     )
     sys.exit(exit_code)
 

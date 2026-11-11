@@ -84,8 +84,8 @@ JOIN   spatial.farm_intelligence fi ON f.uid = fi.farm_uuid
 -- farm_season_results.sql for the full story.
 LEFT JOIN spatial.farm_season_results fsr
        ON  fsr.farm_uuid = fi.farm_uuid
-      AND  fsr.planting_season = %s
-      AND  fsr.planting_year   = %s
+      AND  fsr.planting_season = %(season)s
+      AND  fsr.planting_year   = %(year)s
 WHERE  fi.crop_type IS NOT NULL
   AND  fi.crop_type != 'insufficient_data'
   AND  fi.tile_id IS NOT NULL
@@ -94,8 +94,21 @@ WHERE  fi.crop_type IS NOT NULL
       OR fsr.planting_processed_at IS NULL
       OR fsr.planting_processed_at < NOW() - INTERVAL '30 days'
   )
-ORDER  BY fi.tile_id, fi.farm_uuid
-LIMIT  %s
+  -- Not already attempted in this run / within the retry cooldown. Without
+  -- this (and the attempt rows written for no-signal farms), the same farms
+  -- were re-selected forever and everything sorting after them starved.
+  -- See migrations/0002_add_planting_attempt_tracking.sql.
+  AND  (fsr.planting_attempted_at IS NULL OR fsr.planting_attempted_at < %(retry_before)s)
+ORDER  BY
+    -- Farms from the upload that triggered this run go first.
+    CASE WHEN %(priority_upload_id)s::uuid IS NOT NULL
+              AND f.upload_id = %(priority_upload_id)s::uuid
+         THEN 0 ELSE 1 END,
+    -- Then never-attempted farms, then oldest attempt first (fair rotation).
+    fsr.planting_attempted_at NULLS FIRST,
+    fi.tile_id,
+    fi.farm_uuid
+LIMIT  %(batch_size)s
 """
 
 
@@ -259,7 +272,8 @@ INSERT INTO spatial.farm_season_results (
     planting_date, planting_confidence, planting_confidence_level,
     planting_method, peak_ndvi, peak_ndvi_date, senescence_date,
     season_length_days, ndvi_integral, ndvi_rise_rate, total_rainfall_mm,
-    planting_processed_at, updated_at, county
+    planting_processed_at, updated_at, county,
+    planting_attempted_at, planting_attempt_count, planting_last_outcome
 )
 SELECT
     i.farm_uuid, i.planting_season, i.planting_year,
@@ -267,7 +281,8 @@ SELECT
     i.planting_date, i.planting_confidence, i.planting_confidence_level,
     i.planting_method, i.peak_ndvi, i.peak_ndvi_date, i.senescence_date,
     i.season_length_days, i.ndvi_integral, i.ndvi_rise_rate, i.total_rainfall_mm,
-    i.planting_processed_at, i.updated_at, i.county
+    i.planting_processed_at, i.updated_at, i.county,
+    NOW(), 1, 'detected'
 FROM incoming i
 -- Defense-in-depth: run_datacube_batch.py's _persistable_results() already
 -- filters out empty/failed detections before this is called, but this
@@ -288,12 +303,49 @@ ON CONFLICT (farm_uuid, planting_season, planting_year) DO UPDATE SET
     total_rainfall_mm            = EXCLUDED.total_rainfall_mm,
     planting_processed_at        = EXCLUDED.planting_processed_at,
     updated_at                   = EXCLUDED.updated_at,
-    county                       = EXCLUDED.county
+    county                       = EXCLUDED.county,
+    planting_attempted_at        = EXCLUDED.planting_attempted_at,
+    planting_attempt_count       = spatial.farm_season_results.planting_attempt_count + 1,
+    planting_last_outcome        = EXCLUDED.planting_last_outcome
     -- created_at intentionally omitted: preserves the first-detected
     -- timestamp for this farm+season across re-runs.
 """
 
+# Records that Stage 4 tried a farm for a season WITHOUT producing a
+# persistable planting date (no signal / empty / error). planting_date stays
+# NULL and is never touched here, so an existing real detection is never
+# overwritten. county comes from spatial.farms (FK target); DISTINCT ON
+# guards against a uid appearing twice in the incoming batch.
+_RECORD_ATTEMPTS_SQL = """
+WITH attempts (farm_uuid, outcome, planting_season, planting_year) AS (
+    VALUES %s
+)
+INSERT INTO spatial.farm_season_results (
+    farm_uuid, county, planting_season, planting_year, crop_season,
+    planting_attempted_at, planting_attempt_count, planting_last_outcome, updated_at
+)
+SELECT DISTINCT ON (a.farm_uuid)
+    a.farm_uuid, f.county, a.planting_season, a.planting_year,
+    a.planting_year::text || '_' || a.planting_season,
+    NOW(), 1, a.outcome, NOW()
+FROM attempts a
+JOIN spatial.farms f ON f.uid = a.farm_uuid
+ORDER BY a.farm_uuid
+ON CONFLICT (farm_uuid, planting_season, planting_year) DO UPDATE SET
+    planting_attempted_at  = EXCLUDED.planting_attempted_at,
+    planting_attempt_count = spatial.farm_season_results.planting_attempt_count + 1,
+    planting_last_outcome  = EXCLUDED.planting_last_outcome,
+    updated_at             = EXCLUDED.updated_at
+"""
+
 _CHECK_SEASON_RESULTS_TABLE_SQL = "SELECT to_regclass('spatial.farm_season_results')"
+
+_CHECK_ATTEMPT_COLUMNS_SQL = """
+SELECT 1 FROM information_schema.columns
+WHERE table_schema = 'spatial'
+  AND table_name   = 'farm_season_results'
+  AND column_name  = 'planting_attempted_at'
+"""
 
 
 # ── Pure row builder (unit-testable without a DB connection) ──────────────────
@@ -393,6 +445,16 @@ class DatacubeClient:
                 "this database before running Stage 4 — see that file's "
                 "header for why this table is required."
             )
+        with conn.cursor() as cur:
+            cur.execute(_CHECK_ATTEMPT_COLUMNS_SQL)
+            has_attempt_columns = cur.fetchone() is not None
+        conn.rollback()  # end the read-only transaction; don't hold it open
+        if not has_attempt_columns:
+            raise RuntimeError(
+                "spatial.farm_season_results.planting_attempted_at does not exist. "
+                "Run migrations/0002_add_planting_attempt_tracking.sql against this "
+                "database before running Stage 4."
+            )
 
     def _resolve_host(self) -> str:
         """Use private VPC host inside AWS, public/tunnel host otherwise."""
@@ -418,22 +480,93 @@ class DatacubeClient:
 
     # ── Farm selection ─────────────────────────────────────────────────────────
 
-    def get_eligible_farms(self, season: str, year: int, batch_size: int = 500) -> List[FarmRow]:
+    def get_db_now(self):
+        """Database clock. Used as the run's start marker so the 'already
+        attempted this run' cut-off compares DB timestamps with DB timestamps
+        (planting_attempted_at is set with NOW()), immune to host clock skew."""
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT NOW()")
+                now = cur.fetchone()[0]
+            conn.rollback()
+            return now
+        finally:
+            self._release(conn)
+
+    def get_eligible_farms(
+        self,
+        season: str,
+        year: int,
+        batch_size: int = 500,
+        retry_before=None,
+        priority_upload_id: Optional[str] = None,
+    ) -> List[FarmRow]:
         """
         SELECT farms where crop_type is resolved but planting_date is missing/
-        stale for the given (season, year) specifically.
-        Returns FarmRow objects pre-sorted by tile_id (for tile-group processing).
+        stale for the given (season, year) specifically, skipping farms
+        attempted at or after `retry_before` (i.e. already tried this run or
+        within the retry cooldown).
+
+        Order: farms of `priority_upload_id` first, then never-attempted, then
+        oldest attempt — so no farm can be starved by others that keep
+        failing to produce a signal.
         """
+        if retry_before is None:
+            retry_before = self.get_db_now()
+        params = {
+            "season": season,
+            "year": year,
+            "batch_size": batch_size,
+            "retry_before": retry_before,
+            "priority_upload_id": priority_upload_id or None,
+        }
         conn = self._conn()
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(_ELIGIBLE_FARMS_SQL, (season, year, batch_size))
+                cur.execute(_ELIGIBLE_FARMS_SQL, params)
                 rows = cur.fetchall()
+            conn.rollback()  # read-only; don't leave the pooled conn idle in transaction
             logger.info(
                 "Found %d eligible farms for planting date detection (%s %d)",
                 len(rows), season, year,
             )
             return [FarmRow(**dict(r)) for r in rows]
+        finally:
+            self._release(conn)
+
+    def record_attempts(
+        self,
+        attempts: List[tuple],   # (farm_uuid, outcome)
+        season: str,
+        year: int,
+        dry_run: bool = False,
+    ) -> int:
+        """
+        Record that these farms were tried for (season, year) without a
+        persistable planting date. Never touches planting_date. Non-fatal for
+        the caller's results, but raises so the run is marked partially failed.
+        """
+        if not attempts:
+            return 0
+        if dry_run:
+            logger.info("[DRY RUN] Would record %d attempt(s) without a detection", len(attempts))
+            return len(attempts)
+
+        rows = [(farm_uuid, outcome, season, year) for farm_uuid, outcome in attempts]
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(
+                    cur, _RECORD_ATTEMPTS_SQL, rows,
+                    template="(%s::uuid, %s, %s, %s::smallint)", page_size=500,
+                )
+            conn.commit()
+            return len(rows)
+        except Exception as exc:
+            conn.rollback()
+            logger.error("Recording planting attempts failed: %s", exc, exc_info=True)
+            raise
         finally:
             self._release(conn)
 
